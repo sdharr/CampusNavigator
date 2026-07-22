@@ -320,7 +320,8 @@ export default function PlaceDetailScreen({ route, navigation }: Props) {
           style={styles.showOnMapButton}
           onPress={() =>
             navigation.navigate("Map", {
-              selectedLocation: location,
+              intent: "pin",
+              location: location as any,
             })
           }
           activeOpacity={0.8}

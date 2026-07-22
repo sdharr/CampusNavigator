@@ -22,7 +22,7 @@ import {
   RoadNode,
 } from "./services/roadNodeService";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
-import { RootStackParamList } from "./navigation/AppNavigator";
+import { CampusLocation, RootStackParamList } from "./navigation/AppNavigator";
 import { Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
 import { isInsideCampus } from "./constants/campusBoundary";
 import * as ExpoLocation from "expo-location";
@@ -45,13 +45,26 @@ const DEV_MODE = false;
 const GPS_RECALC_THRESHOLD_METERS = 15;
 /** Max snap distance (metres) when connecting GPS to a road node inside campus. */
 const GPS_MAX_INSIDE_RADIUS_METERS = 300;
+/** Distance (metres) to the destination that triggers the ARRIVED state. */
+const ARRIVAL_THRESHOLD_METERS = 20;
 
-interface Location {
-  id: string;
-  name: string;
-  description: string;
-  latitude: number;
-  longitude: number;
+// ---------------------------------------------------------------------------
+// Navigation phase state machine
+// ---------------------------------------------------------------------------
+/**
+ * The four discrete states the navigation session can be in.
+ *
+ *  IDLE          → no route selected; only location-picker UI visible
+ *  ROUTE_PREVIEW → a route has been calculated and is shown; user can choose
+ *                  a route variant or tap "Start Navigation"
+ *  NAVIGATING    → live GPS watcher is active; compact nav-bar replaces header
+ *  ARRIVED       → user is within ARRIVAL_THRESHOLD_METERS of destination
+ */
+enum NavigationPhase {
+  IDLE = "IDLE",
+  ROUTE_PREVIEW = "ROUTE_PREVIEW",
+  NAVIGATING = "NAVIGATING",
+  ARRIVED = "ARRIVED",
 }
 
 type Props = NativeStackScreenProps<RootStackParamList, "Map">;
@@ -59,24 +72,24 @@ type Props = NativeStackScreenProps<RootStackParamList, "Map">;
 export default function MapScreen({ route, navigation }: Props) {
   const mapRef = useRef<MapView>(null);
 
-  const [locations, setLocations] = useState<Location[]>([]);
+  const [locations, setLocations] = useState<CampusLocation[]>([]);
   const [roadNodes, setRoadNodes] = useState<RoadNode[]>([]);
   const [developerMode, setDeveloperMode] = useState(false);
   const [selectedNode1, setSelectedNode1] = useState<RoadNode | null>(null);
   const [selectedNode2, setSelectedNode2] = useState<RoadNode | null>(null);
-  const [pinLocation, setPinLocation] = useState<any | null>(
-    route.params?.selectedLocation && !route.params?.type
-      ? route.params.selectedLocation
-      : null
+
+  // Pin-only display: shown when intent === "pin" (no routing)
+  const [pinLocation, setPinLocation] = useState<CampusLocation | null>(
+    route.params?.intent === "pin" ? route.params.location : null
   );
-  const [selectedLocation, setSelectedLocation] = useState<Location | null>(null);
+  const [selectedLocation, setSelectedLocation] = useState<CampusLocation | null>(null);
   const [locationConnectMode, setLocationConnectMode] = useState(false);
   const [selectedRoadNode, setSelectedRoadNode] = useState<RoadNode | null>(null);
 
   const [from, setFrom] = useState<string | null>(null);
   const [to, setTo] = useState<string | null>(null);
-  const [startLocation, setStartLocation] = useState<Location | null>(null);
-  const [endLocation, setEndLocation] = useState<Location | null>(null);
+  const [startLocation, setStartLocation] = useState<CampusLocation | null>(null);
+  const [endLocation, setEndLocation] = useState<CampusLocation | null>(null);
 
   const graphRef = useRef<Graph>({});
   const coordinateMapRef = useRef<Record<string, { latitude: number; longitude: number }>>({});
@@ -90,15 +103,18 @@ export default function MapScreen({ route, navigation }: Props) {
   const [gpsAccessSegment, setGpsAccessSegment] = useState<{ latitude: number; longitude: number }[] | null>(null);
   /** Current live GPS coordinate shown as the blue pulsing dot on the map. */
   const [liveGpsPosition, setLiveGpsPosition] = useState<{ latitude: number; longitude: number } | null>(null);
-  /**
-   * True only after the user taps "Start Navigation".
-   * The blue GPS dot and the orange access segment are hidden until this flag
-   * is set — they must never appear during the route-preview phase.
-   */
-  const [isLiveNavigating, setIsLiveNavigating] = useState(false);
+
+  // ---------------------------------------------------------------------------
+  // Navigation phase — single source of truth replacing isLiveNavigating
+  // ---------------------------------------------------------------------------
+  const [navPhase, setNavPhase] = useState<NavigationPhase>(NavigationPhase.IDLE);
 
   const bottomCardAnim = useRef(new Animated.Value(0)).current;
   const [headerHeight, setHeaderHeight] = useState(Platform.OS === "android" ? 220 : 240);
+
+  // Whether the map should follow the user's position during NAVIGATING.
+  // Set to false when the user manually pans the map.
+  const [isFollowingUser, setIsFollowingUser] = useState(false);
 
   // -- Live GPS watcher refs (never stored in Firestore) ---------------------
   const locationWatcherRef = useRef<ExpoLocation.LocationSubscription | null>(null);
@@ -112,12 +128,23 @@ export default function MapScreen({ route, navigation }: Props) {
   const isOutsideCampusRef = useRef<boolean>(false);
   /** Last GPS position used for movement-threshold checks. */
   const lastGpsRef = useRef<{ latitude: number; longitude: number } | null>(null);
+  /**
+   * Stable ref to the road-nodes array so the GPS watcher callback is never
+   * operating on a stale closure. Updated whenever roadNodes state changes.
+   */
+  const roadNodesRef = useRef<RoadNode[]>([]);
+
+  // Keep roadNodesRef in sync with state
+  useEffect(() => {
+    roadNodesRef.current = roadNodes;
+  }, [roadNodes]);
 
   useEffect(() => { loadData(); }, []);
 
   // Stop the GPS watcher when the screen is unmounted
   useEffect(() => { return () => { locationWatcherRef.current?.remove(); }; }, []);
 
+  // Animate the bottom card in/out when a route becomes available
   useEffect(() => {
     Animated.spring(bottomCardAnim, {
       toValue: routeCoordinates.length > 0 ? 1 : 0,
@@ -127,44 +154,61 @@ export default function MapScreen({ route, navigation }: Props) {
     }).start();
   }, [routeCoordinates.length]);
 
+  // ---------------------------------------------------------------------------
+  // Handle incoming route.params from LocationPickerScreen
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!route.params?.selectedLocation) return;
-    if (!route.params.type) return;
-    const location = route.params.selectedLocation;
-    if (route.params.type === "from") {
-      setFrom(location.id);
-      setStartLocation(location);
-      if (location.id === "current-location") {
-        const isInside = isInsideCampus(location.latitude, location.longitude);
+    const params = route.params;
+    if (!params) return;
+
+    if (params.intent === "from") {
+      const loc = params.location;
+      setFrom(loc.id);
+      setStartLocation(loc);
+      if (loc.id === "current-location") {
+        const isInside = isInsideCampus(loc.latitude, loc.longitude);
         setCurrentLocationCampusStatus(isInside ? "inside" : "outside");
+        // Clear any previous route so the user taps Find Route to recompute
         setRouteCoordinates([]);
         setRouteDistanceMeters(null);
         setRouteDurationMinutes(null);
-        // No alert — the user will tap Find Route to compute the live access route.
+        setNavPhase(NavigationPhase.IDLE);
       } else {
         setCurrentLocationCampusStatus(null);
       }
-    } else if (route.params.type === "to") {
-      setTo(location.id);
-      setEndLocation(location);
+      // Restore the preserved TO endpoint so both coexist in state
+      if (params.preservedTo) {
+        setTo(params.preservedTo.id);
+        setEndLocation(params.preservedTo);
+      }
+    } else if (params.intent === "to") {
+      const loc = params.location;
+      setTo(loc.id);
+      setEndLocation(loc);
+      // Restore the preserved FROM endpoint so both coexist in state
+      if (params.preservedFrom) {
+        setFrom(params.preservedFrom.id);
+        setStartLocation(params.preservedFrom);
+      }
+    } else if (params.intent === "pin") {
+      const loc = params.location;
+      setPinLocation(loc);
+      if (typeof loc.latitude === "number" && typeof loc.longitude === "number") {
+        mapRef.current?.animateToRegion(
+          { latitude: loc.latitude, longitude: loc.longitude, latitudeDelta: 0.001, longitudeDelta: 0.001 },
+          1000
+        );
+      }
     }
-  }, [route.params?.selectedLocation, route.params?.type]);
-
-  useEffect(() => {
-    if (!route.params?.selectedLocation || route.params?.type) return;
-    const loc = route.params.selectedLocation;
-    setPinLocation(loc);
-    if (typeof loc.latitude === "number" && typeof loc.longitude === "number") {
-      mapRef.current?.animateToRegion({ latitude: loc.latitude, longitude: loc.longitude, latitudeDelta: 0.001, longitudeDelta: 0.001 }, 1000);
-    }
-  }, [route.params?.selectedLocation, route.params?.type]);
+  }, [route.params]);
 
   async function loadData() {
     try {
-      const locationData = (await getLocations()) as Location[];
+      const locationData = (await getLocations()) as CampusLocation[];
       setLocations(locationData);
       const nodeData = await getRoadNodes();
       setRoadNodes(nodeData);
+      roadNodesRef.current = nodeData;
       const graph = await buildGraph();
       graphRef.current = graph;
       console.log("GRAPH:", graph);
@@ -173,11 +217,17 @@ export default function MapScreen({ route, navigation }: Props) {
       for (const loc of locationData) { coordMap[loc.id] = { latitude: loc.latitude, longitude: loc.longitude }; }
       for (const node of nodeData) { coordMap[node.id] = { latitude: node.latitude, longitude: node.longitude }; }
       coordinateMapRef.current = coordMap;
-      const placePin = route.params?.selectedLocation;
-      if (placePin && !route.params?.type) {
-        setPinLocation(placePin);
-        if (typeof placePin.latitude === "number" && typeof placePin.longitude === "number") {
-          mapRef.current?.animateToRegion({ latitude: placePin.latitude, longitude: placePin.longitude, latitudeDelta: 0.001, longitudeDelta: 0.001 }, 800);
+
+      // If opened with a pin intent from PlaceDetailScreen, focus on it after data loads
+      const params = route.params;
+      if (params?.intent === "pin") {
+        const loc = params.location;
+        setPinLocation(loc as CampusLocation);
+        if (typeof loc.latitude === "number" && typeof loc.longitude === "number") {
+          mapRef.current?.animateToRegion(
+            { latitude: loc.latitude, longitude: loc.longitude, latitudeDelta: 0.001, longitudeDelta: 0.001 },
+            800
+          );
         }
       }
     } catch (error) { console.log(error); }
@@ -221,7 +271,8 @@ export default function MapScreen({ route, navigation }: Props) {
     setRouteDurationMinutes(null);
     setGpsAccessSegment(null);
     setLiveGpsPosition(null);
-    setIsLiveNavigating(false);
+    setNavPhase(NavigationPhase.IDLE);
+    setIsFollowingUser(false);
     connectionNodeIdRef.current = null;
     connectionNodeCoordRef.current = null;
     destinationRef.current = null;
@@ -256,134 +307,210 @@ export default function MapScreen({ route, navigation }: Props) {
     }
   }
 
-  function findRoute() {
-    if (!from || !to) { Alert.alert("Missing Selection", "Please select both locations."); return; }
-    const isCurrentLocation = from === "current-location" && startLocation?.id === "current-location";
-    const start = isCurrentLocation ? startLocation : locations.find((item) => item.id === from) || null;
-    const end = locations.find((item) => item.id === to) || null;
-    setStartLocation(start);
-    setEndLocation(end);
-    if (isCurrentLocation) {
-      if (!start) {
-        Alert.alert("No Route Found", "Your current location is not available yet. Please try again.");
-        clearRoute();
-        return;
+  // ---------------------------------------------------------------------------
+  // Helper: find a valid connection node for a GPS position inside campus.
+  // Tries the nearest road node; if that node is not in the graph, walks
+  // outward through sorted candidates until one is found.
+  // ---------------------------------------------------------------------------
+  function findValidConnectionNode(
+    gpsLat: number,
+    gpsLon: number,
+    nodes: RoadNode[],
+    graph: Graph
+  ): { id: string; coord: { latitude: number; longitude: number } } | null {
+    // Sort all nodes by distance from GPS
+    const sorted = [...nodes]
+      .map((n) => ({
+        node: n,
+        dist: haversineDistance(gpsLat, gpsLon, n.latitude, n.longitude),
+      }))
+      .filter((e) => e.dist <= GPS_MAX_INSIDE_RADIUS_METERS)
+      .sort((a, b) => a.dist - b.dist);
+
+    // Return the first node that actually exists in the graph (has edges)
+    for (const entry of sorted) {
+      if (graph[entry.node.id] && graph[entry.node.id].length > 0) {
+        return {
+          id: entry.node.id,
+          coord: { latitude: entry.node.latitude, longitude: entry.node.longitude },
+        };
       }
+    }
+    return null;
+  }
 
-      const gpsLat = start.latitude;
-      const gpsLon = start.longitude;
-      const isInside = isInsideCampus(gpsLat, gpsLon);
-      setCurrentLocationCampusStatus(isInside ? "inside" : "outside");
-
-      let connNodeId: string;
-      let connNodeCoord: { latitude: number; longitude: number };
-
-      if (!isInside) {
-        // ── Outside campus: route via the existing "Main Gate" location ──────
-        const mainGate = locations.find((loc) => loc.name === "Main Gate");
-        if (!mainGate) {
-          Alert.alert(
-            "Entrance Not Found",
-            "Could not find the 'Main Gate' location in the location list. Please ensure it exists in Firestore."
-          );
-          clearRoute();
-          return;
-        }
-        if (!graphRef.current[mainGate.id]) {
-          Alert.alert(
-            "Entrance Not Connected",
-            "The Main Gate location is not yet connected to the campus road graph."
-          );
-          clearRoute();
-          return;
-        }
-        connNodeId = mainGate.id;
-        connNodeCoord = { latitude: mainGate.latitude, longitude: mainGate.longitude };
-      } else {
-        // ── Inside campus: snap to the nearest road node within radius ────────
-        const nearest = findNearestRoadNode(gpsLat, gpsLon, roadNodes, GPS_MAX_INSIDE_RADIUS_METERS);
-        if (!nearest) {
-          Alert.alert(
-            "No Road Node Nearby",
-            `You are inside the campus but no road node was found within ${GPS_MAX_INSIDE_RADIUS_METERS} m. Try moving closer to a campus road.`
-          );
-          clearRoute();
-          return;
-        }
-        connNodeId = nearest.id;
-        connNodeCoord = { latitude: nearest.latitude, longitude: nearest.longitude };
-      }
-
-      const gpsCoord = { latitude: gpsLat, longitude: gpsLon };
-      const accessDist = haversineDistance(gpsLat, gpsLon, connNodeCoord.latitude, connNodeCoord.longitude);
-      const virtualGraph = buildVirtualGraph(graphRef.current, connNodeId, accessDist);
-
-      // Temporarily inject GPS coords so path IDs can be resolved to coordinates.
-      // Deleted immediately after — never stored permanently.
-      coordinateMapRef.current[GPS_VIRTUAL_NODE_ID] = gpsCoord;
-      const path = dijkstra(virtualGraph, GPS_VIRTUAL_NODE_ID, to);
-      const routePaths = findAlternativeRoutes(virtualGraph, path);
-      delete coordinateMapRef.current[GPS_VIRTUAL_NODE_ID];
-
-      if (path.length < 2) {
-        Alert.alert(
-          "No Route Found",
-          "Could not find a route from your location to the destination. Make sure the destination is connected to the road network."
-        );
-        clearRoute();
-        return;
-      }
-
-      // Campus portion = path after the virtual GPS node (connectionNode → destination)
-      const campusPath = path.slice(1);
-      const campusCoords = campusPath
-        .map((id) => coordinateMapRef.current[id])
-        .filter(Boolean) as { latitude: number; longitude: number }[];
-
-      // Alternative campus portions (same access segment, different campus paths)
-      const altCampusOptions = routePaths
-        .slice(1)
-        .map((altPath) =>
-          altPath
-            .slice(1)
-            .map((id) => coordinateMapRef.current[id])
-            .filter(Boolean) as { latitude: number; longitude: number }[]
-        )
-        .filter((coords) => coords.length >= 1);
-
-      const allRouteOptions = [campusCoords, ...altCampusOptions];
-      setRouteOptions(allRouteOptions);
-      setSelectedRouteIndex(0);
-      setRouteCoordinates(campusCoords);
-      // NOTE: we intentionally do NOT call setGpsAccessSegment / setLiveGpsPosition
-      // here. The orange access segment and blue GPS dot are preview-only artefacts
-      // that must only appear after the user taps "Start Navigation". Persisting
-      // connection refs here so startNavigation() can use the same snapshot for
-      // display purposes is sufficient; the watcher is also NOT started here.
-
-      // Stats include the full route: access segment + campus route
-      computeRouteStats([gpsCoord, ...campusCoords]);
-
-      // Fit map to show the complete route
-      const allVisibleCoords = [gpsCoord, ...campusCoords];
-      if (mapRef.current && allVisibleCoords.length > 0) {
-        mapRef.current.fitToCoordinates(allVisibleCoords, {
-          edgePadding: { top: 260, left: 60, right: 60, bottom: 220 },
-          animated: true,
-        });
-      }
-
-      // Persist connection snapshot in refs so startNavigation() can reference them.
-      // The live watcher is NOT started here — only startNavigation() does that.
-      connectionNodeIdRef.current = connNodeId;
-      connectionNodeCoordRef.current = connNodeCoord;
-      destinationRef.current = to;
-      isOutsideCampusRef.current = !isInside;
-      lastGpsRef.current = gpsCoord;
+  // ---------------------------------------------------------------------------
+  // findRoute — calculates the campus route and shows a preview
+  // ---------------------------------------------------------------------------
+  async function findRoute() {
+    if (!from || !to) {
+      Alert.alert("Missing Selection", "Please select both locations.");
       return;
     }
+
+    const isCurrentLocation = from === "current-location" && startLocation?.id === "current-location";
+
+    if (isCurrentLocation) {
+      // ── Current Location branch: get a fresh GPS fix before routing ──────
+      try {
+        const { status } = await ExpoLocation.requestForegroundPermissionsAsync();
+        if (status !== "granted") {
+          Alert.alert("Permission Needed", "Allow location access to calculate the route.");
+          return;
+        }
+
+        // Get a fresh position — High accuracy for reliable road-node snapping
+        let pos: ExpoLocation.LocationObject;
+        try {
+          pos = await ExpoLocation.getCurrentPositionAsync({
+            accuracy: ExpoLocation.Accuracy.High,
+          });
+        } catch {
+          // Fall back to Balanced if High accuracy times out (common on some Android)
+          pos = await ExpoLocation.getCurrentPositionAsync({
+            accuracy: ExpoLocation.Accuracy.Balanced,
+          });
+        }
+
+        const gpsLat = pos.coords.latitude;
+        const gpsLon = pos.coords.longitude;
+        const gpsCoord = { latitude: gpsLat, longitude: gpsLon };
+
+        // Update startLocation with the fresh coordinate
+        const freshCurrentLocation: CampusLocation = {
+          id: "current-location",
+          name: "Current Location",
+          description: "Live device location",
+          latitude: gpsLat,
+          longitude: gpsLon,
+        };
+        setStartLocation(freshCurrentLocation);
+
+        const isInside = isInsideCampus(gpsLat, gpsLon);
+        setCurrentLocationCampusStatus(isInside ? "inside" : "outside");
+
+        let connNodeId: string;
+        let connNodeCoord: { latitude: number; longitude: number };
+
+        if (!isInside) {
+          // ── Outside campus: route via the "Main Gate" Firestore location ──
+          const mainGate = locations.find((loc) => loc.name === "Main Gate");
+          if (!mainGate) {
+            Alert.alert(
+              "Entrance Not Found",
+              "Could not find the 'Main Gate' location. Please ensure it exists in Firestore."
+            );
+            clearRoute();
+            return;
+          }
+          if (!graphRef.current[mainGate.id]) {
+            Alert.alert(
+              "Entrance Not Connected",
+              "The Main Gate location is not yet connected to the campus road graph."
+            );
+            clearRoute();
+            return;
+          }
+          connNodeId = mainGate.id;
+          connNodeCoord = { latitude: mainGate.latitude, longitude: mainGate.longitude };
+        } else {
+          // ── Inside campus: snap to nearest graph-connected road node ─────
+          const connection = findValidConnectionNode(
+            gpsLat,
+            gpsLon,
+            roadNodesRef.current,
+            graphRef.current
+          );
+          if (!connection) {
+            Alert.alert(
+              "No Road Node Nearby",
+              `You are inside the campus but no road node was found within ${GPS_MAX_INSIDE_RADIUS_METERS} m. Try moving closer to a campus road.`
+            );
+            clearRoute();
+            return;
+          }
+          connNodeId = connection.id;
+          connNodeCoord = connection.coord;
+        }
+
+        const accessDist = haversineDistance(gpsLat, gpsLon, connNodeCoord.latitude, connNodeCoord.longitude);
+        const virtualGraph = buildVirtualGraph(graphRef.current, connNodeId, accessDist);
+
+        // Temporarily inject GPS coords for path ID → coordinate resolution
+        coordinateMapRef.current[GPS_VIRTUAL_NODE_ID] = gpsCoord;
+        const path = dijkstra(virtualGraph, GPS_VIRTUAL_NODE_ID, to);
+        const routePaths = findAlternativeRoutes(virtualGraph, path);
+        delete coordinateMapRef.current[GPS_VIRTUAL_NODE_ID];
+
+        if (path.length < 2) {
+          Alert.alert(
+            "No Route Found",
+            "Could not find a route from your location to the destination. Make sure the destination is connected to the road network."
+          );
+          clearRoute();
+          return;
+        }
+
+        // Campus portion = path after the virtual GPS node (connection → destination)
+        const campusPath = path.slice(1);
+        const campusCoords = campusPath
+          .map((id) => coordinateMapRef.current[id])
+          .filter(Boolean) as { latitude: number; longitude: number }[];
+
+        // Alternative campus portions (same access segment, different campus paths)
+        const altCampusOptions = routePaths
+          .slice(1)
+          .map((altPath) =>
+            altPath
+              .slice(1)
+              .map((id) => coordinateMapRef.current[id])
+              .filter(Boolean) as { latitude: number; longitude: number }[]
+          )
+          .filter((coords) => coords.length >= 1);
+
+        const allRouteOptions = [campusCoords, ...altCampusOptions];
+        setRouteOptions(allRouteOptions);
+        setSelectedRouteIndex(0);
+        setRouteCoordinates(campusCoords);
+        setNavPhase(NavigationPhase.ROUTE_PREVIEW);
+
+        // Stats include the full route: access segment + campus route
+        computeRouteStats([gpsCoord, ...campusCoords]);
+
+        // Fit map to show the complete route including GPS origin
+        const allVisibleCoords = [gpsCoord, ...campusCoords];
+        if (mapRef.current && allVisibleCoords.length > 0) {
+          mapRef.current.fitToCoordinates(allVisibleCoords, {
+            edgePadding: { top: 260, left: 60, right: 60, bottom: 220 },
+            animated: true,
+          });
+        }
+
+        // Persist connection snapshot in refs so startNavigation() can reference them.
+        // The live watcher is NOT started here — only startNavigation() does that.
+        connectionNodeIdRef.current = connNodeId;
+        connectionNodeCoordRef.current = connNodeCoord;
+        destinationRef.current = to;
+        isOutsideCampusRef.current = !isInside;
+        lastGpsRef.current = gpsCoord;
+        return;
+      } catch (error) {
+        console.log("findRoute GPS error:", error);
+        Alert.alert("GPS Error", "Could not obtain your current location. Please try again.");
+        return;
+      }
+    }
+
+    // ── Normal campus→campus route (no GPS involved) ──────────────────────────
+    const end = locations.find((item) => item.id === to) || null;
+    setEndLocation(end);
+
     const path = dijkstra(graphRef.current, from, to);
-    if (path.length < 2) { Alert.alert("No Route Found", "Could not find a route between these locations. Make sure both locations are connected to the road network."); clearRoute(); return; }
+    if (path.length < 2) {
+      Alert.alert("No Route Found", "Could not find a route between these locations. Make sure both locations are connected to the road network.");
+      clearRoute();
+      return;
+    }
     const routePaths = findAlternativeRoutes(graphRef.current, path);
     const pathCoordinates = path.map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[];
     const alternativeRouteCoordinates = routePaths.slice(1).map((routePath) => {
@@ -393,43 +520,49 @@ export default function MapScreen({ route, navigation }: Props) {
     const availableRouteOptions = [pathCoordinates, ...alternativeRouteCoordinates];
     setRouteOptions(availableRouteOptions);
     setSelectedRouteIndex(0);
+    setNavPhase(NavigationPhase.ROUTE_PREVIEW);
     displayRoute(pathCoordinates);
   }
 
-  /**
-   * Called when the user taps "Start Navigation" in the bottom card.
-   *
-   * This is the ONLY place where:
-   *   - a fresh GPS fix is requested
-   *   - the blue live GPS marker is shown
-   *   - the orange access segment is rendered
-   *   - the GPS watcher is started
-   *
-   * Route calculation (Dijkstra) is re-run from the fresh coordinate so that
-   * the live route is always based on the real GPS position at navigation start,
-   * not the snapshot taken when the user first selected "Current Location".
-   */
+  // ---------------------------------------------------------------------------
+  // startNavigation — transitions from ROUTE_PREVIEW → NAVIGATING
+  //
+  // This is the ONLY place where:
+  //   - a fresh High-accuracy GPS fix is obtained
+  //   - the blue live GPS marker becomes visible
+  //   - the orange access segment is rendered
+  //   - the live GPS watcher is started
+  //   - the camera zooms to the user's current position
+  // ---------------------------------------------------------------------------
   async function startNavigation() {
-    if (!from || !to || from !== "current-location") {
+    if (from !== "current-location") {
       Alert.alert("Cannot Start", "Select Current Location as your starting point first.");
+      return;
+    }
+    if (!to) {
+      Alert.alert("Cannot Start", "Please select a destination first.");
       return;
     }
 
     try {
-      // 1. Request permission
+      // 1. Permission
       const { status } = await ExpoLocation.requestForegroundPermissionsAsync();
       if (status !== "granted") {
-        Alert.alert(
-          "Permission Needed",
-          "Allow location access to start navigation."
-        );
+        Alert.alert("Permission Needed", "Allow location access to start navigation.");
         return;
       }
 
-      // 2. Get the latest GPS fix
-      const pos = await ExpoLocation.getCurrentPositionAsync({
-        accuracy: ExpoLocation.Accuracy.High,
-      });
+      // 2. Fresh High-accuracy GPS fix
+      let pos: ExpoLocation.LocationObject;
+      try {
+        pos = await ExpoLocation.getCurrentPositionAsync({
+          accuracy: ExpoLocation.Accuracy.High,
+        });
+      } catch {
+        pos = await ExpoLocation.getCurrentPositionAsync({
+          accuracy: ExpoLocation.Accuracy.Balanced,
+        });
+      }
       const gpsLat = pos.coords.latitude;
       const gpsLon = pos.coords.longitude;
       const gpsCoord = { latitude: gpsLat, longitude: gpsLon };
@@ -437,55 +570,42 @@ export default function MapScreen({ route, navigation }: Props) {
       const isInside = isInsideCampus(gpsLat, gpsLon);
       setCurrentLocationCampusStatus(isInside ? "inside" : "outside");
 
-      // 3. Determine connection node (Main Gate outside, nearest road node inside)
+      // 3. Determine connection node
       let connNodeId: string;
       let connNodeCoord: { latitude: number; longitude: number };
 
       if (!isInside) {
-        // ── Outside campus: route via the existing "Main Gate" location ──────
         const mainGate = locations.find((loc) => loc.name === "Main Gate");
         if (!mainGate) {
-          Alert.alert(
-            "Entrance Not Found",
-            "Could not find the 'Main Gate' location. Please ensure it exists in Firestore."
-          );
+          Alert.alert("Entrance Not Found", "Could not find the 'Main Gate' location. Please ensure it exists in Firestore.");
           return;
         }
         if (!graphRef.current[mainGate.id]) {
-          Alert.alert(
-            "Entrance Not Connected",
-            "The Main Gate location is not yet connected to the campus road graph."
-          );
+          Alert.alert("Entrance Not Connected", "The Main Gate location is not yet connected to the campus road graph.");
           return;
         }
         connNodeId = mainGate.id;
         connNodeCoord = { latitude: mainGate.latitude, longitude: mainGate.longitude };
       } else {
-        // ── Inside campus: snap to the nearest road node within radius ────────
-        const nearest = findNearestRoadNode(
+        const connection = findValidConnectionNode(
           gpsLat,
           gpsLon,
-          roadNodes,
-          GPS_MAX_INSIDE_RADIUS_METERS
+          roadNodesRef.current,
+          graphRef.current
         );
-        if (!nearest) {
+        if (!connection) {
           Alert.alert(
             "No Road Node Nearby",
-            `You are inside the campus but no road node was found within ${GPS_MAX_INSIDE_RADIUS_METERS} m. Try moving closer to a campus road.`
+            `You are inside the campus but no road node was found within ${GPS_MAX_INSIDE_RADIUS_METERS} m.`
           );
           return;
         }
-        connNodeId = nearest.id;
-        connNodeCoord = { latitude: nearest.latitude, longitude: nearest.longitude };
+        connNodeId = connection.id;
+        connNodeCoord = connection.coord;
       }
 
       // 4. Build virtual graph and run Dijkstra from fresh GPS position
-      const accessDist = haversineDistance(
-        gpsLat,
-        gpsLon,
-        connNodeCoord.latitude,
-        connNodeCoord.longitude
-      );
+      const accessDist = haversineDistance(gpsLat, gpsLon, connNodeCoord.latitude, connNodeCoord.longitude);
       const virtualGraph = buildVirtualGraph(graphRef.current, connNodeId, accessDist);
 
       coordinateMapRef.current[GPS_VIRTUAL_NODE_ID] = gpsCoord;
@@ -516,31 +636,36 @@ export default function MapScreen({ route, navigation }: Props) {
         )
         .filter((c) => c.length >= 1);
 
-      // 5. Update state — this is the moment the blue dot and segment appear
+      // 5. Transition to NAVIGATING — this is the moment the blue dot appears
       setRouteOptions([campusCoords, ...altCampusOptions]);
       setSelectedRouteIndex(0);
       setRouteCoordinates(campusCoords);
       setGpsAccessSegment([gpsCoord, connNodeCoord]);
       setLiveGpsPosition(gpsCoord);
-      setIsLiveNavigating(true);           // ← blue dot + orange segment now visible
+      setNavPhase(NavigationPhase.NAVIGATING);
+      setIsFollowingUser(true);
       computeRouteStats([gpsCoord, ...campusCoords]);
 
-      const allVisibleCoords = [gpsCoord, ...campusCoords];
-      if (mapRef.current && allVisibleCoords.length > 0) {
-        mapRef.current.fitToCoordinates(allVisibleCoords, {
-          edgePadding: { top: 260, left: 60, right: 60, bottom: 220 },
-          animated: true,
-        });
-      }
+      // 6. Animate camera to user's GPS position at navigation zoom level
+      // (professional navigation UX: start zoomed in on the user, not the whole route)
+      mapRef.current?.animateToRegion(
+        {
+          latitude: gpsLat,
+          longitude: gpsLon,
+          latitudeDelta: 0.002,
+          longitudeDelta: 0.002,
+        },
+        800
+      );
 
-      // 6. Persist refs so the watcher's onGpsUpdate() can update the route
+      // 7. Persist refs for the watcher
       connectionNodeIdRef.current = connNodeId;
       connectionNodeCoordRef.current = connNodeCoord;
       destinationRef.current = to;
       isOutsideCampusRef.current = !isInside;
       lastGpsRef.current = gpsCoord;
 
-      // 7. Start the live GPS watcher — this is the only place it starts
+      // 8. Start the live GPS watcher — only here
       startLiveGpsWatcher();
     } catch (error) {
       console.log("startNavigation error:", error);
@@ -549,9 +674,27 @@ export default function MapScreen({ route, navigation }: Props) {
   }
 
   // ---------------------------------------------------------------------------
-  // Live GPS watcher — updates the access segment as the user moves
+  // cancelNavigation — transitions NAVIGATING/ARRIVED → ROUTE_PREVIEW
   // ---------------------------------------------------------------------------
+  function cancelNavigation() {
+    stopLiveGpsWatcher();
+    setGpsAccessSegment(null);
+    setLiveGpsPosition(null);
+    setIsFollowingUser(false);
+    connectionNodeIdRef.current = null;
+    connectionNodeCoordRef.current = null;
+    lastGpsRef.current = null;
+    // Return to ROUTE_PREVIEW if a route is still shown, otherwise IDLE
+    if (routeCoordinates.length > 0) {
+      setNavPhase(NavigationPhase.ROUTE_PREVIEW);
+    } else {
+      setNavPhase(NavigationPhase.IDLE);
+    }
+  }
 
+  // ---------------------------------------------------------------------------
+  // Live GPS watcher
+  // ---------------------------------------------------------------------------
   async function startLiveGpsWatcher() {
     stopLiveGpsWatcher(); // ensure no stale subscription
     try {
@@ -565,6 +708,7 @@ export default function MapScreen({ route, navigation }: Props) {
       locationWatcherRef.current = sub;
     } catch (error) {
       console.log("GPS watcher error:", error);
+      Alert.alert("GPS Error", "Lost GPS signal. Navigation may be less accurate.");
     }
   }
 
@@ -583,7 +727,38 @@ export default function MapScreen({ route, navigation }: Props) {
     setLiveGpsPosition(newGps);
     setGpsAccessSegment([newGps, connNodeCoord]);
 
-    // Movement threshold check
+    // ── Arrival check ─────────────────────────────────────────────────────────
+    const destCoord = coordinateMapRef.current[destId];
+    if (destCoord) {
+      const distToDest = haversineDistance(
+        newGps.latitude,
+        newGps.longitude,
+        destCoord.latitude,
+        destCoord.longitude
+      );
+      if (distToDest < ARRIVAL_THRESHOLD_METERS) {
+        stopLiveGpsWatcher();
+        setGpsAccessSegment(null);
+        setRouteCoordinates([]);
+        setNavPhase(NavigationPhase.ARRIVED);
+        return;
+      }
+    }
+
+    // ── Camera follow (only if user hasn't manually panned) ──────────────────
+    if (isFollowingUser) {
+      mapRef.current?.animateToRegion(
+        {
+          latitude: newGps.latitude,
+          longitude: newGps.longitude,
+          latitudeDelta: 0.002,
+          longitudeDelta: 0.002,
+        },
+        300
+      );
+    }
+
+    // ── Movement threshold ────────────────────────────────────────────────────
     const last = lastGpsRef.current;
     const moved = last
       ? haversineDistance(last.latitude, last.longitude, newGps.latitude, newGps.longitude)
@@ -591,37 +766,36 @@ export default function MapScreen({ route, navigation }: Props) {
     lastGpsRef.current = newGps;
 
     if (isOutsideCampusRef.current) {
-      // Outside campus: Main Gate is a fixed entrance — no Dijkstra recalculation needed.
-      // The access segment (GPS → Main Gate) updates above automatically.
+      // Outside campus: Main Gate is a fixed entrance — access segment update above suffices
       return;
     }
 
-    // Inside campus: only full-recalculate if the user moved far enough
+    // Inside campus: only re-run Dijkstra if user moved far enough
     if (moved < GPS_RECALC_THRESHOLD_METERS) {
       return;
     }
 
-    // Find nearest road node at new position
-    const nearest = findNearestRoadNode(
+    // Find nearest GRAPH-CONNECTED road node at new position
+    const connection = findValidConnectionNode(
       newGps.latitude,
       newGps.longitude,
-      roadNodes,
-      GPS_MAX_INSIDE_RADIUS_METERS
+      roadNodesRef.current,  // use ref, not stale state closure
+      graphRef.current
     );
-    if (!nearest) return; // No node in range — keep existing route
+    if (!connection) return; // No node in range — keep existing route
 
-    // If the connection node hasn't changed, just the segment update above suffices
-    if (nearest.id === connNodeId) return;
+    // If the connection node hasn't changed, the segment update above suffices
+    if (connection.id === connNodeId) return;
 
     // New connection node — rebuild virtual graph and re-run Dijkstra
-    const newConnNodeCoord = { latitude: nearest.latitude, longitude: nearest.longitude };
+    const newConnNodeCoord = connection.coord;
     const accessDist = haversineDistance(
       newGps.latitude,
       newGps.longitude,
-      nearest.latitude,
-      nearest.longitude
+      newConnNodeCoord.latitude,
+      newConnNodeCoord.longitude
     );
-    const virtualGraph = buildVirtualGraph(graphRef.current, nearest.id, accessDist);
+    const virtualGraph = buildVirtualGraph(graphRef.current, connection.id, accessDist);
 
     coordinateMapRef.current[GPS_VIRTUAL_NODE_ID] = newGps;
     const path = dijkstra(virtualGraph, GPS_VIRTUAL_NODE_ID, destId);
@@ -634,8 +808,8 @@ export default function MapScreen({ route, navigation }: Props) {
       .map((id) => coordinateMapRef.current[id])
       .filter(Boolean) as { latitude: number; longitude: number }[];
 
-    // Update state with the new connection
-    connectionNodeIdRef.current = nearest.id;
+    // Update connection refs and route
+    connectionNodeIdRef.current = connection.id;
     connectionNodeCoordRef.current = newConnNodeCoord;
     setGpsAccessSegment([newGps, newConnNodeCoord]);
     setRouteCoordinates(campusCoords);
@@ -650,7 +824,7 @@ export default function MapScreen({ route, navigation }: Props) {
     setSelectedNode2(null);
   }
 
-  function selectLocation(location: Location) {
+  function selectLocation(location: CampusLocation) {
     if (!locationConnectMode) return;
     setSelectedLocation(location);
   }
@@ -677,7 +851,7 @@ export default function MapScreen({ route, navigation }: Props) {
     } catch (e) { console.log(e); Alert.alert("Error", "Could not connect location."); }
   }
 
-  // -- Swap from / to (real state swap) -----------------------------------------
+  // Swap from / to (real state swap)
   function swapFromTo() {
     const prevFrom = from;
     const prevTo = to;
@@ -691,6 +865,9 @@ export default function MapScreen({ route, navigation }: Props) {
     clearRoute();
   }
 
+  // ---------------------------------------------------------------------------
+  // Derived display values
+  // ---------------------------------------------------------------------------
   const distanceLabel = routeDistanceMeters !== null
     ? routeDistanceMeters >= 1000 ? `${(routeDistanceMeters / 1000).toFixed(2)} km` : `${Math.round(routeDistanceMeters)} m`
     : "--";
@@ -699,8 +876,10 @@ export default function MapScreen({ route, navigation }: Props) {
     ? routeDurationMinutes < 1 ? "< 1 min" : `${Math.round(routeDurationMinutes)} min`
     : "--";
 
-  const showBottomCard = routeCoordinates.length > 0;
+  const showBottomCard = routeCoordinates.length > 0 && navPhase !== NavigationPhase.NAVIGATING && navPhase !== NavigationPhase.ARRIVED;
   const isCurrentLocationRoute = from === "current-location" && startLocation?.id === "current-location";
+  const isNavigating = navPhase === NavigationPhase.NAVIGATING;
+  const isArrived = navPhase === NavigationPhase.ARRIVED;
 
   const bottomCardTranslateY = bottomCardAnim.interpolate({ inputRange: [0, 1], outputRange: [160, 0] });
   const bottomCardOpacity = bottomCardAnim;
@@ -715,8 +894,13 @@ export default function MapScreen({ route, navigation }: Props) {
         initialRegion={{ latitude: 32.716289, longitude: 74.866404, latitudeDelta: 0.001, longitudeDelta: 0.001 }}
         onMapReady={focusCampus}
         onPress={() => setPinLocation(null)}
+        onPanDrag={() => {
+          // User manually panned — disengage camera follow
+          if (isFollowingUser) setIsFollowingUser(false);
+        }}
       >
-        {startLocation && (
+        {/* Start location marker — suppressed during NAVIGATING (live GPS dot takes over) */}
+        {startLocation && !isNavigating && (
           <Marker coordinate={{ latitude: startLocation.latitude, longitude: startLocation.longitude }} title={startLocation.name} description={startLocation.description} pinColor="green" />
         )}
         {endLocation && (
@@ -731,8 +915,8 @@ export default function MapScreen({ route, navigation }: Props) {
           <Polyline coordinates={routeCoordinates} strokeColor="#1565C0" strokeWidth={5} lineDashPattern={undefined} zIndex={2} />
         )}
         {/* GPS access segment — dashed amber line from live position to connection node.
-             Only rendered during active live navigation (isLiveNavigating = true). */}
-        {isLiveNavigating && gpsAccessSegment && gpsAccessSegment.length >= 2 && (
+             Only rendered during active live navigation (NAVIGATING). */}
+        {isNavigating && gpsAccessSegment && gpsAccessSegment.length >= 2 && (
           <Polyline
             coordinates={gpsAccessSegment}
             strokeColor="#FF6F00"
@@ -743,8 +927,8 @@ export default function MapScreen({ route, navigation }: Props) {
         )}
         {/* Live GPS position marker — blue pulsing dot.
              Must NOT appear before the user taps "Start Navigation".
-             Gated on isLiveNavigating so no stale/snapshot coordinate is ever shown. */}
-        {isLiveNavigating && liveGpsPosition && (
+             Gated on NAVIGATING so no stale/snapshot coordinate is ever shown. */}
+        {isNavigating && liveGpsPosition && (
           <Marker
             coordinate={liveGpsPosition}
             anchor={{ x: 0.5, y: 0.5 }}
@@ -768,83 +952,172 @@ export default function MapScreen({ route, navigation }: Props) {
         )}
       </MapView>
 
-      {/* -- Blue Header with From / Swap / To / Find Route -- */}
-      <SafeAreaView
-        edges={["top"]}
-        style={styles.headerSafeArea}
-        onLayout={(e) => setHeaderHeight(e.nativeEvent.layout.height)}
-      >
-        <View style={styles.titleRow}>
-          <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()} activeOpacity={0.75}>
-            <Ionicons name="arrow-back" size={22} color="#fff" />
-          </TouchableOpacity>
-          <Text style={styles.headerTitle}>Navigate Campus</Text>
-          <View style={styles.backButton} />
-        </View>
-
-        {/*
-          Column layout inside controlsGroup:
-            Row 1 (fieldsRow): fieldsColumn (flex:1) + swapZone (fixed 46px)
-            Row 2: findRouteButton — full width of controlsGroup
-        */}
-        <View style={styles.controlsGroup}>
-          {/* ── Row 1: FROM / TO fields + swap button ── */}
-          <View style={styles.fieldsRow}>
-            {/* Left: FROM + TO stacked */}
-            <View style={styles.fieldsColumn}>
-              {/* FROM */}
-              <TouchableOpacity
-                style={styles.fieldButton}
-                activeOpacity={0.85}
-                onPress={() => navigation.navigate("LocationPicker", { type: "from" })}
-              >
-                <View style={[styles.fieldDot, { backgroundColor: "#4CAF50" }]} />
-                <Text style={[styles.fieldText, startLocation ? styles.fieldTextActive : styles.fieldTextPlaceholder]} numberOfLines={1}>
-                  {startLocation?.name ?? "Choose starting point"}
-                </Text>
-              </TouchableOpacity>
-
-              {isCurrentLocationRoute && currentLocationCampusStatus === "outside" && (
-                <Text style={styles.campusWarning}>Current location is outside the campus boundary.</Text>
+      {/* ── NAVIGATING / ARRIVED overlay — replaces header during active navigation ── */}
+      {(isNavigating || isArrived) && (
+        <SafeAreaView edges={["top"]} style={styles.navBarSafeArea}>
+          <View style={styles.navBar}>
+            {/* Left: destination info */}
+            <View style={styles.navBarInfo}>
+              {isArrived ? (
+                <>
+                  <Ionicons name="checkmark-circle" size={22} color="#4CAF50" style={{ marginRight: 8 }} />
+                  <View>
+                    <Text style={styles.navBarLabel}>You have arrived!</Text>
+                    <Text style={styles.navBarDestination} numberOfLines={1}>
+                      {endLocation?.name ?? "Destination"}
+                    </Text>
+                  </View>
+                </>
+              ) : (
+                <>
+                  <Ionicons name="navigate-circle" size={22} color="#fff" style={{ marginRight: 8 }} />
+                  <View>
+                    <Text style={styles.navBarLabel}>Navigating to</Text>
+                    <Text style={styles.navBarDestination} numberOfLines={1}>
+                      {endLocation?.name ?? "Destination"}
+                    </Text>
+                  </View>
+                </>
               )}
-
-              {/* TO */}
-              <TouchableOpacity
-                style={styles.fieldButton}
-                activeOpacity={0.85}
-                onPress={() => navigation.navigate("LocationPicker", { type: "to" })}
-              >
-                <View style={[styles.fieldDot, { backgroundColor: "#F44336" }]} />
-                <Text style={[styles.fieldText, endLocation ? styles.fieldTextActive : styles.fieldTextPlaceholder]} numberOfLines={1}>
-                  {endLocation?.name ?? "Choose destination"}
-                </Text>
-              </TouchableOpacity>
             </View>
 
-            {/* Right: swap zone — button centred at FROM/TO boundary */}
-            <View style={styles.swapZone}>
-              <TouchableOpacity style={styles.swapButton} onPress={swapFromTo} activeOpacity={0.8}>
-                <Ionicons name="swap-vertical" size={18} color="#1565C0" />
+            {/* Right: distance + cancel */}
+            <View style={styles.navBarRight}>
+              {!isArrived && (
+                <Text style={styles.navBarDistance}>{distanceLabel}</Text>
+              )}
+              <TouchableOpacity
+                style={styles.cancelNavButton}
+                onPress={cancelNavigation}
+                activeOpacity={0.8}
+              >
+                <Ionicons name="close" size={18} color="#fff" />
+                <Text style={styles.cancelNavText}>
+                  {isArrived ? "Done" : "Cancel"}
+                </Text>
               </TouchableOpacity>
             </View>
           </View>
 
-          {/* ── Row 2: Find Route — full width of controlsGroup ── */}
-          <TouchableOpacity style={styles.findRouteButton} onPress={findRoute} activeOpacity={0.85}>
-            <Ionicons name="navigate" size={16} color="#1565C0" style={{ marginRight: 6 }} />
-            <Text style={styles.findRouteButtonText}>Find Route</Text>
+          {/* Recenter button — reappears when user has manually panned away */}
+          {isNavigating && !isFollowingUser && (
+            <TouchableOpacity
+              style={styles.recenterButton}
+              onPress={() => {
+                setIsFollowingUser(true);
+                if (liveGpsPosition) {
+                  mapRef.current?.animateToRegion(
+                    {
+                      latitude: liveGpsPosition.latitude,
+                      longitude: liveGpsPosition.longitude,
+                      latitudeDelta: 0.002,
+                      longitudeDelta: 0.002,
+                    },
+                    400
+                  );
+                }
+              }}
+              activeOpacity={0.85}
+            >
+              <Ionicons name="locate" size={20} color="#1565C0" />
+            </TouchableOpacity>
+          )}
+        </SafeAreaView>
+      )}
+
+      {/* ── Normal route-planning header — hidden during NAVIGATING / ARRIVED ── */}
+      {!isNavigating && !isArrived && (
+        <SafeAreaView
+          edges={["top"]}
+          style={styles.headerSafeArea}
+          onLayout={(e) => setHeaderHeight(e.nativeEvent.layout.height)}
+        >
+          <View style={styles.titleRow}>
+            <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()} activeOpacity={0.75}>
+              <Ionicons name="arrow-back" size={22} color="#fff" />
+            </TouchableOpacity>
+            <Text style={styles.headerTitle}>Navigate Campus</Text>
+            <View style={styles.backButton} />
+          </View>
+
+          {/*
+            Column layout inside controlsGroup:
+              Row 1 (fieldsRow): fieldsColumn (flex:1) + swapZone (fixed 46px)
+              Row 2: findRouteButton — full width of controlsGroup
+          */}
+          <View style={styles.controlsGroup}>
+            {/* ── Row 1: FROM / TO fields + swap button ── */}
+            <View style={styles.fieldsRow}>
+              {/* Left: FROM + TO stacked */}
+              <View style={styles.fieldsColumn}>
+                {/* FROM */}
+                <TouchableOpacity
+                  style={styles.fieldButton}
+                  activeOpacity={0.85}
+                  onPress={() =>
+                    navigation.navigate("LocationPicker", {
+                      type: "from",
+                      // Pass current TO so LocationPicker can echo it back
+                      currentTo: endLocation ?? undefined,
+                    })
+                  }
+                >
+                  <View style={[styles.fieldDot, { backgroundColor: "#4CAF50" }]} />
+                  <Text style={[styles.fieldText, startLocation ? styles.fieldTextActive : styles.fieldTextPlaceholder]} numberOfLines={1}>
+                    {startLocation?.name ?? "Choose starting point"}
+                  </Text>
+                </TouchableOpacity>
+
+                {isCurrentLocationRoute && currentLocationCampusStatus === "outside" && (
+                  <Text style={styles.campusWarning}>Current location is outside the campus boundary.</Text>
+                )}
+
+                {/* TO */}
+                <TouchableOpacity
+                  style={styles.fieldButton}
+                  activeOpacity={0.85}
+                  onPress={() =>
+                    navigation.navigate("LocationPicker", {
+                      type: "to",
+                      // Pass current FROM so LocationPicker can echo it back
+                      currentFrom: startLocation ?? undefined,
+                    })
+                  }
+                >
+                  <View style={[styles.fieldDot, { backgroundColor: "#F44336" }]} />
+                  <Text style={[styles.fieldText, endLocation ? styles.fieldTextActive : styles.fieldTextPlaceholder]} numberOfLines={1}>
+                    {endLocation?.name ?? "Choose destination"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Right: swap zone — button centred at FROM/TO boundary */}
+              <View style={styles.swapZone}>
+                <TouchableOpacity style={styles.swapButton} onPress={swapFromTo} activeOpacity={0.8}>
+                  <Ionicons name="swap-vertical" size={18} color="#1565C0" />
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* ── Row 2: Find Route — full width of controlsGroup ── */}
+            <TouchableOpacity style={styles.findRouteButton} onPress={findRoute} activeOpacity={0.85}>
+              <Ionicons name="navigate" size={16} color="#1565C0" style={{ marginRight: 6 }} />
+              <Text style={styles.findRouteButtonText}>Find Route</Text>
+            </TouchableOpacity>
+          </View>
+        </SafeAreaView>
+      )}
+
+      {/* Walking pill — floats just below the header (hidden during navigation) */}
+      {!isNavigating && !isArrived && (
+        <View style={[styles.walkingPillWrapper, { top: headerHeight + 12 }]}>
+          <TouchableOpacity style={styles.walkingPill} activeOpacity={0.85}>
+            <MaterialCommunityIcons name="walk" size={18} color="#1565C0" />
+            <Text style={styles.walkingPillText}>Walking</Text>
+            <Ionicons name="chevron-forward" size={14} color="#1565C0" style={{ marginLeft: 2 }} />
           </TouchableOpacity>
         </View>
-      </SafeAreaView>
-
-      {/* -- Walking pill � floats just below the header -- */}
-      <View style={[styles.walkingPillWrapper, { top: headerHeight + 12 }]}>
-        <TouchableOpacity style={styles.walkingPill} activeOpacity={0.85}>
-          <MaterialCommunityIcons name="walk" size={18} color="#1565C0" />
-          <Text style={styles.walkingPillText}>Walking</Text>
-          <Ionicons name="chevron-forward" size={14} color="#1565C0" style={{ marginLeft: 2 }} />
-        </TouchableOpacity>
-      </View>
+      )}
 
       {/* Developer tools panel */}
       {DEV_MODE && (
@@ -871,7 +1144,7 @@ export default function MapScreen({ route, navigation }: Props) {
         </View>
       )}
 
-      {/* -- Floating Bottom Card: Route Summary -- */}
+      {/* ── Floating Bottom Card: Route Summary (ROUTE_PREVIEW only) ── */}
       {showBottomCard && (
         <Animated.View style={[styles.bottomCard, { opacity: bottomCardOpacity, transform: [{ translateY: bottomCardTranslateY }] }]}>
           <View style={styles.routeHeaderRow}>
@@ -912,13 +1185,13 @@ export default function MapScreen({ route, navigation }: Props) {
         </Animated.View>
       )}
 
-      {/* -- Place pin info card -- */}
+      {/* Place pin info card */}
       {pinLocation && (
         <View style={styles.pinInfoCardWrapper} pointerEvents="box-none">
           <TouchableOpacity style={styles.pinInfoCard} activeOpacity={1} onPress={() => { }}>
             <Text style={styles.pinInfoName} numberOfLines={2}>{pinLocation.name ?? ""}</Text>
-            {typeof pinLocation.where === "string" && pinLocation.where.trim() ? (
-              <Text style={styles.pinInfoDetail} numberOfLines={2}>{pinLocation.where.trim()}</Text>
+            {typeof (pinLocation as any).where === "string" && (pinLocation as any).where.trim() ? (
+              <Text style={styles.pinInfoDetail} numberOfLines={2}>{(pinLocation as any).where.trim()}</Text>
             ) : null}
           </TouchableOpacity>
         </View>
@@ -957,7 +1230,6 @@ const styles = StyleSheet.create({
   headerTitle: { flex: 1, textAlign: "center", fontSize: 20, fontWeight: "700", color: "#fff", letterSpacing: 0.3 },
 
   // -- Controls group -----------------------------------------------------------
-  // Column layout: fieldsRow (FROM+TO+swap) on top, findRouteButton spanning full width below
   controlsGroup: {
     flexDirection: "column",
     marginHorizontal: 14,
@@ -969,13 +1241,11 @@ const styles = StyleSheet.create({
     gap: 8,
   },
 
-  // Top row inside controlsGroup: fieldsColumn (flex:1) + swapZone (fixed width)
   fieldsRow: {
     flexDirection: "row",
     alignItems: "flex-start",
   },
 
-  // Left column inside fieldsRow: FROM + TO stacked
   fieldsColumn: {
     flex: 1,
     gap: 8,
@@ -999,12 +1269,6 @@ const styles = StyleSheet.create({
 
   campusWarning: { color: "#FFCDD2", fontSize: 11, marginLeft: 4, lineHeight: 15 },
 
-  // Right column: reserves horizontal space for the swap button.
-  // paddingTop pushes the button so its centre aligns with the FROM/TO boundary.
-  //   field height  = paddingVertical*2 + ~18px text = ~40px
-  //   gap between fields = 8px  =>  boundary mid = 40 + 4 = 44px from top
-  //   button height = 36px, half = 18px
-  //   paddingTop = 44 - 18 = 26px
   swapZone: {
     width: 46,
     alignItems: "center",
@@ -1040,6 +1304,83 @@ const styles = StyleSheet.create({
     shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.12, shadowRadius: 5, elevation: 5,
   },
   walkingPillText: { color: "#1A1A2E", fontWeight: "600", fontSize: 13 },
+
+  // -- Navigation Bar (NAVIGATING / ARRIVED state) --------------------------------
+  navBarSafeArea: {
+    backgroundColor: BLUE_PRIMARY,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 12,
+  },
+  navBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  navBarInfo: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+    marginRight: 12,
+  },
+  navBarLabel: {
+    color: "rgba(255,255,255,0.75)",
+    fontSize: 11,
+    fontWeight: "500",
+    letterSpacing: 0.3,
+  },
+  navBarDestination: {
+    color: "#fff",
+    fontSize: 16,
+    fontWeight: "700",
+    letterSpacing: 0.2,
+  },
+  navBarRight: {
+    alignItems: "flex-end",
+    gap: 6,
+  },
+  navBarDistance: {
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: "600",
+    opacity: 0.9,
+  },
+  cancelNavButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255,255,255,0.2)",
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    gap: 5,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.35)",
+  },
+  cancelNavText: {
+    color: "#fff",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  recenterButton: {
+    position: "absolute",
+    right: 16,
+    bottom: -56,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#fff",
+    justifyContent: "center",
+    alignItems: "center",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.18,
+    shadowRadius: 6,
+    elevation: 8,
+  },
 
   // -- Bottom Floating Card -----------------------------------------------------
   bottomCard: {
@@ -1111,5 +1452,3 @@ const styles = StyleSheet.create({
     backgroundColor: "#1565C0",
   },
 });
-
-

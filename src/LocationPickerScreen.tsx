@@ -16,21 +16,13 @@ import { NativeStackScreenProps } from "@react-navigation/native-stack";
 import * as ExpoLocation from "expo-location";
 
 import { getLocations } from "./services/locationService";
-import { RootStackParamList } from "./navigation/AppNavigator";
-interface Location {
-  id: string;
-  name: string;
-  description: string;
-  latitude: number;
-  longitude: number;
-}
+import { CampusLocation, RootStackParamList } from "./navigation/AppNavigator";
 
 type Props = NativeStackScreenProps<RootStackParamList, "LocationPicker">;
 
 export default function LocationPickerScreen({ navigation, route }: Props) {
 
-
-  const [locations, setLocations] = useState<Location[]>([]);
+  const [locations, setLocations] = useState<CampusLocation[]>([]);
   const [search, setSearch] = useState("");
   const isFromSelection = route.params?.type === "from";
 
@@ -41,7 +33,7 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
   async function loadLocations() {
     try {
       const data = await getLocations();
-      setLocations(data as Location[]);
+      setLocations(data as CampusLocation[]);
     } catch (error) {
       console.log(error);
     }
@@ -59,8 +51,14 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
         return;
       }
 
-      const position = await ExpoLocation.getCurrentPositionAsync({});
-      const currentLocation: Location = {
+      // Use Balanced accuracy: faster than High but still suitable for snapping
+      // to a campus road node. A precise fresh fix is obtained again in
+      // startNavigation() at High accuracy before live routing begins.
+      const position = await ExpoLocation.getCurrentPositionAsync({
+        accuracy: ExpoLocation.Accuracy.Balanced,
+      });
+
+      const currentLocation: CampusLocation = {
         id: "current-location",
         name: "Current Location",
         latitude: position.coords.latitude,
@@ -68,9 +66,14 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
         description: "Live device location",
       };
 
-      navigation.popTo("Map", {
-        selectedLocation: currentLocation,
-        type: "from",
+      // navigate() works on React Navigation v6 and v7 alike. When the Map
+      // screen is already in the stack this will update its route.params and
+      // bring it to the front without creating a duplicate entry.
+      navigation.navigate("Map", {
+        intent: "from",
+        location: currentLocation,
+        // Echo the preserved TO back so MapScreen can restore both endpoints
+        preservedTo: route.params?.currentTo,
       });
     } catch (error) {
       console.log(error);
@@ -84,6 +87,7 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
   const filteredLocations = locations.filter((item) =>
     item.name.toLowerCase().includes(search.toLowerCase())
   );
+
   const getIcon = (name: string) => {
     const text = name.toLowerCase();
 
@@ -206,11 +210,24 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
                 marginBottom: 10,
                 flexDirection: "row",
                 alignItems: "center",
-              }} onPress={() => {
-                navigation.popTo("Map", {
-                  selectedLocation: item,
-                  type: route.params.type,
-                });
+              }}
+              onPress={() => {
+                const isFrom = route.params.type === "from";
+                if (isFrom) {
+                  navigation.navigate("Map", {
+                    intent: "from",
+                    location: item,
+                    // Echo back the preserved TO endpoint
+                    preservedTo: route.params.currentTo,
+                  });
+                } else {
+                  navigation.navigate("Map", {
+                    intent: "to",
+                    location: item,
+                    // Echo back the preserved FROM endpoint
+                    preservedFrom: route.params.currentFrom,
+                  });
+                }
               }}
             >
               <Ionicons
