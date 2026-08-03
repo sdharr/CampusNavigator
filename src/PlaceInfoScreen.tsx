@@ -15,7 +15,7 @@ import { RootStackParamList } from "./navigation/AppNavigator";
 
 type Props = NativeStackScreenProps<RootStackParamList, "PlaceInfo">;
 type IconName = React.ComponentProps<typeof Ionicons>["name"];
-type TabType = "departments" | "other";
+type TabType = "all" | "departments" | "other";
 
 // ─── Icon helper ─────────────────────────────────────────────────────────────
 function getLocationIcon(name: string): IconName {
@@ -40,7 +40,7 @@ export default function PlaceInfoScreen({ navigation }: Props) {
   const [locations, setLocations] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
-  const [activeTab, setActiveTab] = useState<TabType>("departments");
+  const [activeTab, setActiveTab] = useState<TabType>("all");
 
   useEffect(() => {
     async function loadLocations() {
@@ -66,6 +66,7 @@ export default function PlaceInfoScreen({ navigation }: Props) {
 
   // ── Filtering ───────────────────────────────────────────────────────────────
   const tabFiltered = locations.filter((item) => {
+    if (activeTab === "all") return true;
     const isDepartment = item.type === "department";
     return activeTab === "departments" ? isDepartment : !isDepartment;
   });
@@ -77,7 +78,9 @@ export default function PlaceInfoScreen({ navigation }: Props) {
   const emptyLabel =
     activeTab === "departments"
       ? "No departments found"
-      : "No places found";
+      : activeTab === "other"
+        ? "No places found"
+        : "No places found";
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -102,6 +105,21 @@ export default function PlaceInfoScreen({ navigation }: Props) {
 
         {/* Category tabs */}
         <View style={styles.tabRow}>
+          <TouchableOpacity
+            style={[styles.tab, activeTab === "all" && styles.tabActive]}
+            onPress={() => { setActiveTab("all"); setSearch(""); }}
+            activeOpacity={0.8}
+          >
+            <Ionicons
+              name="grid-outline"
+              size={16}
+              color={activeTab === "all" ? "#FFFFFF" : "#1565C0"}
+            />
+            <Text style={[styles.tabText, activeTab === "all" && styles.tabTextActive]}>
+              All
+            </Text>
+          </TouchableOpacity>
+
           <TouchableOpacity
             style={[styles.tab, activeTab === "departments" && styles.tabActive]}
             onPress={() => { setActiveTab("departments"); setSearch(""); }}
@@ -128,7 +146,7 @@ export default function PlaceInfoScreen({ navigation }: Props) {
               color={activeTab === "other" ? "#FFFFFF" : "#1565C0"}
             />
             <Text style={[styles.tabText, activeTab === "other" && styles.tabTextActive]}>
-              Other Places
+              Others
             </Text>
           </TouchableOpacity>
         </View>
@@ -256,7 +274,7 @@ const styles = StyleSheet.create({
   },
   tabText: {
     color: PRIMARY,
-    fontSize: 14,
+    fontSize: 12,
     fontWeight: "700",
   },
   tabTextActive: {

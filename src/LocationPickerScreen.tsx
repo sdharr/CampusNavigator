@@ -113,7 +113,7 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
     >
       <View
         style={{
-          height: 70,
+          height: 90,
           backgroundColor: "#1565C0",
           flexDirection: "row",
           alignItems: "center",
@@ -122,6 +122,7 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
       >
         <TouchableOpacity
           onPress={() => navigation.goBack()}
+          style={{ marginTop: 20 }}
         >
           <Ionicons
             name="arrow-back"
@@ -136,6 +137,7 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
             fontSize: 22,
             fontWeight: "700",
             marginLeft: 20,
+            marginTop: 20,
           }}
         >
           Select Location
@@ -158,12 +160,14 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
 
           <TextInput
             placeholder="Search location..."
+            placeholderTextColor="#888"
             value={search}
             onChangeText={setSearch}
             style={{
               flex: 1,
               marginLeft: 10,
               height: 45,
+              color: "#000",
             }}
           />
         </View>

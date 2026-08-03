@@ -15,20 +15,15 @@
     "ios": {
       "supportsTablet": true
     },
-   "android": {
-  "adaptiveIcon": {
-    "foregroundImage": "./assets/adaptive-icon.png",
-    "backgroundColor": "#ffffff"
-  },
-  "edgeToEdgeEnabled": true,
-  "predictiveBackGestureEnabled": false,
-  "package": "com.anonymous.CampusNavigator",
-  "config": {
-    "googleMaps": {
-      "apiKey": "AIzaSyBNZAKTbmGxEduSpQECBtqOHDRwbC69aL4"
-    }
-  }
-},
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "package": "com.anonymous.CampusNavigator"
+    },
     "web": {
       "favicon": "./assets/favicon.png"
     },
@@ -38,7 +33,8 @@
       }
     },
     "plugins": [
-      "expo-font"
+      "expo-font",
+      "@maplibre/maplibre-react-native"
     ]
   }
 }

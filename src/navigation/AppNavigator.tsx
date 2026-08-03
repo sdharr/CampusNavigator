@@ -6,7 +6,7 @@ import MapScreen from "../MapScreen";
 import PlaceInfoScreen from "../PlaceInfoScreen";
 import PlaceDetailScreen from "../PlaceDetailScreen";
 import LocationPickerScreen from "../LocationPickerScreen";
-
+import MapScreenOSM from "../MapScreenOSM";
 // ---------------------------------------------------------------------------
 // Shared location type used throughout the navigation system.
 // Every named campus location and the virtual "current-location" object
@@ -30,9 +30,9 @@ export interface CampusLocation {
 // ---------------------------------------------------------------------------
 export type MapParams =
   | undefined
-  | { intent: "pin";  location: CampusLocation }
+  | { intent: "pin"; location: CampusLocation }
   | { intent: "from"; location: CampusLocation; preservedTo?: CampusLocation }
-  | { intent: "to";   location: CampusLocation; preservedFrom?: CampusLocation };
+  | { intent: "to"; location: CampusLocation; preservedFrom?: CampusLocation };
 
 export type RootStackParamList = {
   Home: undefined;
@@ -74,7 +74,7 @@ export default function AppNavigator() {
         />
         <Stack.Screen
           name="Map"
-          component={MapScreen}
+          component={MapScreenOSM}
           options={{ headerShown: false }}
         />
 
