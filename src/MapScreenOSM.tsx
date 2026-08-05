@@ -6,6 +6,7 @@ import {
   TouchableOpacity,
   Alert,
   Animated,
+  ActivityIndicator,
   StatusBar,
   Platform,
 } from "react-native";
@@ -43,14 +44,21 @@ import {
 
 // ---------------------------------------------------------------------------
 // MapTiler key + style URL
-// ---------------------------------------------------------------------------
-const MAPTILER_KEY = "m8NHB3NwPV0bbo6blhZY";
-const MAP_STYLE = `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`;
 
+const MAPTILER_KEY = "m8NHB3NwPV0bbo6blhZY";
+
+const STREET_STYLE =
+  `https://api.maptiler.com/maps/streets-v2/style.json?key=${MAPTILER_KEY}`;
+
+const SATELLITE_STYLE =
+  `https://api.maptiler.com/maps/hybrid/style.json?key=${MAPTILER_KEY}`;
+
+// Change this one line to switch styles
+const MAP_STYLE = SATELLITE_STYLE;
 // Toggle developer/editing tools for the whole screen.
 // When false, all dev-only UI is hidden but the underlying
 // functions (connectNodes, connectLocation, etc.) are untouched.
-const DEV_MODE = true;
+const DEV_MODE = false;
 
 // ---------------------------------------------------------------------------
 // Live GPS routing configuration
@@ -80,20 +88,7 @@ const CAMPUS_MIN_ZOOM = 13;
 /** Maximum zoom: retain MapTiler's full detail for close-up navigation. */
 const CAMPUS_MAX_ZOOM = 20;
 
-/**
- * Tight bounding box of the campus polygon (no extra buffer).
- * Derived directly from CAMPUS_BOUNDARY extremes in campusBoundary.ts:
- *   min lat P7 32.714063, max lat P1 32.721962
- *   min lng P11 74.862607, max lng P4 74.874484
- * Used for the initial camera view and the "focus campus" reset so the
- * entire campus fits the screen comfortably on any device size.
- */
-const CAMPUS_TIGHT_BOUNDS: [number, number, number, number] = [
-  74.862607, // west  — P11 (campus min lng)
-  32.714063, // south — P7  (campus min lat)
-  74.874484, // east  — P4  (campus max lng)
-  32.721962, // north — P1  (campus max lat)
-];
+
 
 // ---------------------------------------------------------------------------
 // Navigation phase state machine
@@ -210,6 +205,7 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   const [headerHeight, setHeaderHeight] = useState(Platform.OS === "android" ? 220 : 240);
 
   const [isFollowingUser, setIsFollowingUser] = useState(false);
+  const [isFindingRoute, setIsFindingRoute] = useState(false);
 
   // -- Live GPS watcher refs --
   const locationWatcherRef = useRef<ExpoLocation.LocationSubscription | null>(null);
@@ -337,11 +333,11 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   }
 
   function focusCampus() {
-    // fitBounds guarantees the whole campus is visible regardless of device
-    // screen size, whereas a fixed zoom + single centre point can leave edges
-    // cropped on smaller screens or show too much sky on tablets.
-    cameraRef.current?.fitBounds(CAMPUS_TIGHT_BOUNDS, {
-      padding: { top: 80, left: 60, right: 60, bottom: 80 },
+    // Fly to the fixed campus centre at zoom 16 — matches the initialViewState
+    // below so the idle camera is always consistent regardless of screen size.
+    cameraRef.current?.flyTo({
+      center: [CAMPUS_CENTER_LNG, CAMPUS_CENTER_LAT],
+      zoom: 16,
       duration: 1000,
     });
   }
@@ -459,6 +455,9 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   // findRoute
   // ---------------------------------------------------------------------------
   async function findRoute() {
+    if (isFindingRoute) return;
+    console.log("[findRoute] 1. Find Route started");
+
     if (!from || !to) {
       Alert.alert("Missing Selection", "Please select both locations.");
       return;
@@ -468,18 +467,29 @@ export default function MapScreenOSM({ route, navigation }: Props) {
 
     if (isCurrentLocation) {
       try {
+        // ── Spinner ON: only while waiting for GPS I/O ──
+        setIsFindingRoute(true);
+
+        console.log("[findRoute] 2. Before requesting location permission");
         const { status } = await ExpoLocation.requestForegroundPermissionsAsync();
         if (status !== "granted") {
           Alert.alert("Permission Needed", "Allow location access to calculate the route.");
+          setIsFindingRoute(false);
           return;
         }
+        console.log("[findRoute] 3. After permission granted, status:", status);
 
         let pos: ExpoLocation.LocationObject;
+        console.log("[findRoute] 4. Before getCurrentPositionAsync()");
         try {
           pos = await ExpoLocation.getCurrentPositionAsync({ accuracy: ExpoLocation.Accuracy.High });
         } catch {
           pos = await ExpoLocation.getCurrentPositionAsync({ accuracy: ExpoLocation.Accuracy.Balanced });
         }
+        console.log("[findRoute] 5. After getCurrentPositionAsync(), lat:", pos.coords.latitude, "lon:", pos.coords.longitude);
+
+        // ── Spinner OFF: GPS coordinates obtained, rest is synchronous ──
+        setIsFindingRoute(false);
 
         const gpsLat = pos.coords.latitude;
         const gpsLon = pos.coords.longitude;
@@ -529,9 +539,11 @@ export default function MapScreenOSM({ route, navigation }: Props) {
         const virtualGraph = buildVirtualGraph(graphRef.current, connNodeId, accessDist);
 
         coordinateMapRef.current[GPS_VIRTUAL_NODE_ID] = gpsCoord;
+        console.log("[findRoute] 6. Before Dijkstra, from:", GPS_VIRTUAL_NODE_ID, "to:", to);
         const path = dijkstra(virtualGraph, GPS_VIRTUAL_NODE_ID, to);
         const routePaths = findAlternativeRoutes(virtualGraph, path);
         delete coordinateMapRef.current[GPS_VIRTUAL_NODE_ID];
+        console.log("[findRoute] 7. After Dijkstra, path.length:", path.length);
 
         if (path.length < 2) {
           Alert.alert("No Route Found", "Could not find a route from your location to the destination.");
@@ -554,6 +566,7 @@ export default function MapScreenOSM({ route, navigation }: Props) {
         const allRouteOptions = [campusCoords, ...altCampusOptions];
         setRouteOptions(allRouteOptions);
         setSelectedRouteIndex(0);
+        console.log("[findRoute] 8. Before setRouteCoordinates(), campusCoords.length:", campusCoords.length);
         setRouteCoordinates(campusCoords);
         setNavPhase(NavigationPhase.ROUTE_PREVIEW);
 
@@ -567,19 +580,24 @@ export default function MapScreenOSM({ route, navigation }: Props) {
         destinationRef.current = to;
         isOutsideCampusRef.current = !isInside;
         lastGpsRef.current = gpsCoord;
+        console.log("[findRoute] 9. Before setIsFindingRoute(false) — GPS path success");
+        console.log("[findRoute] 10. End of function — GPS path");
         return;
       } catch (error) {
         console.log("findRoute GPS error:", error);
         Alert.alert("GPS Error", "Could not obtain your current location. Please try again.");
+        setIsFindingRoute(false);
         return;
       }
     }
 
-    // Normal campus→campus route
+    // Normal campus→campus route — no spinner, runs synchronously
     const end = locations.find((item) => item.id === to) || null;
     setEndLocation(end);
 
+    console.log("[findRoute] 6. Before Dijkstra (campus), from:", from, "to:", to);
     const path = dijkstra(graphRef.current, from, to);
+    console.log("[findRoute] 7. After Dijkstra (campus), path.length:", path.length);
     if (path.length < 2) {
       Alert.alert("No Route Found", "Could not find a route between these locations.");
       clearRoute();
@@ -595,7 +613,10 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     setRouteOptions(availableRouteOptions);
     setSelectedRouteIndex(0);
     setNavPhase(NavigationPhase.ROUTE_PREVIEW);
+    console.log("[findRoute] 8. Before setRouteCoordinates() (campus), pathCoordinates.length:", pathCoordinates.length);
     displayRoute(pathCoordinates);
+    console.log("[findRoute] 9. Before setIsFindingRoute(false) — campus path success");
+    console.log("[findRoute] 10. End of function — campus path");
   }
 
   // ---------------------------------------------------------------------------
@@ -792,7 +813,11 @@ export default function MapScreenOSM({ route, navigation }: Props) {
 
     const connection = findValidConnectionNode(newGps.latitude, newGps.longitude, roadNodesRef.current, graphRef.current);
     if (!connection) return;
-    if (connection.id === connNodeId) return;
+
+    // ----- FIX: removed `if (connection.id === connNodeId) return;` -----
+    // That guard blocked ALL route/distance updates whenever the nearest road
+    // node hadn't changed yet — the common case while walking along a segment.
+    // We now always recompute the remaining route after sufficient movement.
 
     const newConnNodeCoord = connection.coord;
     const accessDist = haversineDistance(newGps.latitude, newGps.longitude, newConnNodeCoord.latitude, newConnNodeCoord.longitude);
@@ -807,11 +832,25 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     const campusPath = path.slice(1);
     const campusCoords = campusPath.map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[];
 
+    // Trim the leading waypoints that the user has already walked past.
+    // Find the waypoint index closest to the current GPS position and slice
+    // from there so the already-walked portion of the blue line disappears.
+    let closestIdx = 0;
+    let closestDist = Infinity;
+    for (let i = 0; i < campusCoords.length; i++) {
+      const d = haversineDistance(
+        newGps.latitude, newGps.longitude,
+        campusCoords[i].latitude, campusCoords[i].longitude
+      );
+      if (d < closestDist) { closestDist = d; closestIdx = i; }
+    }
+    const remainingCoords = campusCoords.slice(closestIdx);
+
     connectionNodeIdRef.current = connection.id;
     connectionNodeCoordRef.current = newConnNodeCoord;
     setGpsAccessSegment([newGps, newConnNodeCoord]);
-    setRouteCoordinates(campusCoords);
-    computeRouteStats([newGps, ...campusCoords]);
+    setRouteCoordinates(remainingCoords);
+    computeRouteStats([newGps, ...remainingCoords]);
   }
 
   function selectNode(node: RoadNode) {
@@ -928,10 +967,10 @@ export default function MapScreenOSM({ route, navigation }: Props) {
         <Camera
           ref={cameraRef}
           initialViewState={{
-            // Use bounds so MapLibre computes the correct zoom for the
-            // device’s viewport — the entire campus is visible on first render.
-            bounds: CAMPUS_TIGHT_BOUNDS,
-            padding: { top: 80, left: 60, right: 60, bottom: 80 },
+            // Fixed centre + zoom matches focusCampus() so the idle view is
+            // identical whether the map has just mounted or data has reloaded.
+            center: [CAMPUS_CENTER_LNG, CAMPUS_CENTER_LAT],
+            zoom: 16,
           }}
           minZoom={CAMPUS_MIN_ZOOM}
           maxZoom={CAMPUS_MAX_ZOOM}
@@ -966,9 +1005,17 @@ export default function MapScreenOSM({ route, navigation }: Props) {
           </GeoJSONSource>
         )}
 
-        {/* Main/selected route (blue) */}
+        {/* Main/selected route — white casing beneath blue fill */}
         {mainRouteGeoJSON && (
           <GeoJSONSource id="main-route-source" data={mainRouteGeoJSON}>
+            {/* Casing: wider white stroke rendered first (bottom) */}
+            <Layer
+              id="main-route-casing"
+              type="line"
+              paint={{ "line-color": "#FFFFFF", "line-width": 9, "line-opacity": 0.9 }}
+              layout={{ "line-cap": "round", "line-join": "round" }}
+            />
+            {/* Fill: blue stroke rendered on top */}
             <Layer
               id="main-route-layer"
               type="line"
@@ -1204,9 +1251,20 @@ export default function MapScreenOSM({ route, navigation }: Props) {
               </View>
 
               {/* ── Row 2: Find Route ── */}
-              <TouchableOpacity style={styles.findRouteButton} onPress={findRoute} activeOpacity={0.85}>
-                <Ionicons name="navigate" size={16} color="#1565C0" style={{ marginRight: 6 }} />
-                <Text style={styles.findRouteButtonText}>Find Route</Text>
+              <TouchableOpacity
+                style={[styles.findRouteButton, isFindingRoute && styles.findRouteButtonDisabled]}
+                onPress={findRoute}
+                activeOpacity={0.85}
+                disabled={isFindingRoute}
+              >
+                {isFindingRoute ? (
+                  <ActivityIndicator size="small" color="#1565C0" style={{ marginRight: 6 }} />
+                ) : (
+                  <Ionicons name="navigate" size={16} color="#1565C0" style={{ marginRight: 6 }} />
+                )}
+                <Text style={styles.findRouteButtonText}>
+                  {isFindingRoute ? "Finding Route…" : "Find Route"}
+                </Text>
               </TouchableOpacity>
             </View>
           </SafeAreaView>
@@ -1401,6 +1459,7 @@ const styles = StyleSheet.create({
     shadowColor: "#000", shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.08, shadowRadius: 3, elevation: 2,
   },
   findRouteButtonText: { color: BLUE_PRIMARY, fontWeight: "700", fontSize: 14, letterSpacing: 0.3 },
+  findRouteButtonDisabled: { opacity: 0.55 },
 
   // -- Walking Pill -------------------------------------------------------------
   walkingPillWrapper: { position: "absolute", left: 14 },
