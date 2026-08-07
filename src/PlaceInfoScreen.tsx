@@ -1,21 +1,24 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import {
   View,
   Text,
   FlatList,
   TextInput,
   TouchableOpacity,
-  ActivityIndicator,
   StyleSheet,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import { getLocations } from "./services/locationService";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { RootStackParamList } from "./navigation/AppNavigator";
+import { useCampusData } from "./context/CampusDataContext";
+import SkeletonCard from "./components/SkeletonCard";
 
 type Props = NativeStackScreenProps<RootStackParamList, "PlaceInfo">;
 type IconName = React.ComponentProps<typeof Ionicons>["name"];
 type TabType = "all" | "departments" | "other";
+
+// Number of skeleton cards shown while data loads.
+const SKELETON_COUNT = 7;
 
 // ─── Icon helper ─────────────────────────────────────────────────────────────
 function getLocationIcon(name: string): IconName {
@@ -37,41 +40,20 @@ function getLocationIcon(name: string): IconName {
 
 // ─── Screen ───────────────────────────────────────────────────────────────────
 export default function PlaceInfoScreen({ navigation }: Props) {
-  const [locations, setLocations] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { isReady, data } = useCampusData();
+  const locations = data?.locations ?? [];
+
   const [search, setSearch] = useState("");
   const [activeTab, setActiveTab] = useState<TabType>("all");
 
-  useEffect(() => {
-    async function loadLocations() {
-      try {
-        const data = await getLocations();
-        setLocations(data);
-      } catch (error) {
-        console.log(error);
-      } finally {
-        setLoading(false);
-      }
-    }
-    loadLocations();
-  }, []);
-
-  if (loading) {
-    return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#1565C0" />
-      </View>
-    );
-  }
-
   // ── Filtering ───────────────────────────────────────────────────────────────
-  const tabFiltered = locations.filter((item) => {
+  const tabFiltered = locations.filter((item: any) => {
     if (activeTab === "all") return true;
     const isDepartment = item.type === "department";
     return activeTab === "departments" ? isDepartment : !isDepartment;
   });
 
-  const filteredLocations = tabFiltered.filter((item) =>
+  const filteredLocations = tabFiltered.filter((item: any) =>
     (item.name ?? "").toLowerCase().includes(search.toLowerCase())
   );
 
@@ -85,7 +67,7 @@ export default function PlaceInfoScreen({ navigation }: Props) {
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <View style={styles.container}>
-      {/* Search bar */}
+      {/* Search bar — always visible */}
       <View style={styles.searchSection}>
         <View style={styles.searchBar}>
           <Ionicons name="search" size={20} color="#1565C0" />
@@ -95,6 +77,7 @@ export default function PlaceInfoScreen({ navigation }: Props) {
             value={search}
             onChangeText={setSearch}
             style={styles.searchInput}
+            editable={isReady}
           />
           {search.length > 0 && (
             <TouchableOpacity onPress={() => setSearch("")} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
@@ -103,7 +86,7 @@ export default function PlaceInfoScreen({ navigation }: Props) {
           )}
         </View>
 
-        {/* Category tabs */}
+        {/* Category tabs — always visible */}
         <View style={styles.tabRow}>
           <TouchableOpacity
             style={[styles.tab, activeTab === "all" && styles.tabActive]}
@@ -152,50 +135,61 @@ export default function PlaceInfoScreen({ navigation }: Props) {
         </View>
       </View>
 
-      {/* List */}
-      <FlatList
-        data={filteredLocations}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.listContent}
-        renderItem={({ item }) => (
-          <TouchableOpacity
-            style={styles.locationCard}
-            onPress={() => navigation.navigate("PlaceDetail", { location: item })}
-            activeOpacity={0.8}
-          >
-            <View style={styles.locationIconContainer}>
-              <Ionicons
-                name={getLocationIcon(item.name ?? "")}
-                size={23}
-                color="#1565C0"
-              />
-            </View>
+      {/* ── Skeleton list — shown while data loads ── */}
+      {!isReady && (
+        <View style={styles.listContent}>
+          {Array.from({ length: SKELETON_COUNT }).map((_, i) => (
+            <SkeletonCard key={`skeleton-${i}`} />
+          ))}
+        </View>
+      )}
 
-            <View style={styles.locationDetails}>
-              <Text style={styles.locationName} numberOfLines={1}>
-                {item.name}
-              </Text>
-              {item.description ? (
-                <Text style={styles.locationDescription} numberOfLines={1}>
-                  {item.description}
-                </Text>
-              ) : item.where ? (
-                <Text style={styles.locationDescription} numberOfLines={1}>
-                  {item.where}
-                </Text>
-              ) : null}
-            </View>
+      {/* ── Real list — only rendered once data is ready ── */}
+      {isReady && (
+        <FlatList
+          data={filteredLocations}
+          keyExtractor={(item: any) => item.id}
+          contentContainerStyle={styles.listContent}
+          renderItem={({ item }: { item: any }) => (
+            <TouchableOpacity
+              style={styles.locationCard}
+              onPress={() => navigation.navigate("PlaceDetail", { location: item })}
+              activeOpacity={0.8}
+            >
+              <View style={styles.locationIconContainer}>
+                <Ionicons
+                  name={getLocationIcon(item.name ?? "")}
+                  size={23}
+                  color="#1565C0"
+                />
+              </View>
 
-            <Ionicons name="chevron-forward" size={21} color="#94A3B8" />
-          </TouchableOpacity>
-        )}
-        ListEmptyComponent={
-          <View style={styles.emptyState}>
-            <Ionicons name="search-outline" size={28} color="#94A3B8" />
-            <Text style={styles.emptyStateText}>{emptyLabel}</Text>
-          </View>
-        }
-      />
+              <View style={styles.locationDetails}>
+                <Text style={styles.locationName} numberOfLines={1}>
+                  {item.name}
+                </Text>
+                {item.description ? (
+                  <Text style={styles.locationDescription} numberOfLines={1}>
+                    {item.description}
+                  </Text>
+                ) : item.where ? (
+                  <Text style={styles.locationDescription} numberOfLines={1}>
+                    {item.where}
+                  </Text>
+                ) : null}
+              </View>
+
+              <Ionicons name="chevron-forward" size={21} color="#94A3B8" />
+            </TouchableOpacity>
+          )}
+          ListEmptyComponent={
+            <View style={styles.emptyState}>
+              <Ionicons name="search-outline" size={28} color="#94A3B8" />
+              <Text style={styles.emptyStateText}>{emptyLabel}</Text>
+            </View>
+          }
+        />
+      )}
     </View>
   );
 }
@@ -206,12 +200,6 @@ const PRIMARY = "#1565C0";
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#F5F7FB",
-  },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
     backgroundColor: "#F5F7FB",
   },
 

@@ -1,5 +1,6 @@
-import React from "react";
+import React, { useRef, useState } from "react";
 import {
+  Animated,
   Image,
   Platform,
   ScrollView,
@@ -99,6 +100,19 @@ function InformationRow({
 // ─── Main screen ──────────────────────────────────────────────────────────────
 export default function PlaceDetailScreen({ route, navigation }: Props) {
   const insets = useSafeAreaInsets();
+
+  // ── Hero image loading state ───────────────────────────────────────────────
+  const [imageLoaded, setImageLoaded] = useState(false);
+  const imageFade = useRef(new Animated.Value(0)).current;
+
+  function handleImageLoad() {
+    setImageLoaded(true);
+    Animated.timing(imageFade, {
+      toValue: 1,
+      duration: 350,
+      useNativeDriver: true,
+    }).start();
+  }
   const location = route.params.location as LocationDoc;
 
   // ── Safely extract every displayable field ─────────────────────────────────
@@ -178,11 +192,19 @@ export default function PlaceDetailScreen({ route, navigation }: Props) {
       >
         {/* ── Hero image / branded fallback ── */}
         {imageUrl ? (
-          <Image
-            source={{ uri: imageUrl }}
-            style={styles.heroImage}
-            resizeMode="cover"
-          />
+          <View style={styles.heroImage}>
+            {/* Placeholder — always visible behind the image */}
+            <View style={[StyleSheet.absoluteFillObject, styles.heroImagePlaceholder]}>
+              <Ionicons name="image-outline" size={36} color="#93C5FD" />
+            </View>
+            {/* Real image fades in on load */}
+            <Animated.Image
+              source={{ uri: imageUrl }}
+              style={[StyleSheet.absoluteFillObject, styles.heroImageAbsolute, { opacity: imageFade }]}
+              resizeMode="cover"
+              onLoad={handleImageLoad}
+            />
+          </View>
         ) : (
           <View style={styles.heroFallback}>
             <Ionicons name="location" size={52} color={PRIMARY} />
@@ -391,7 +413,19 @@ const styles = StyleSheet.create({
     width: "100%",
     height: 230,
     borderRadius: 20,
+    overflow: "hidden",
     backgroundColor: BLUE_TINT,
+  },
+  /** Blue-tint rectangle + centred icon shown behind the image while it loads */
+  heroImagePlaceholder: {
+    backgroundColor: BLUE_TINT,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  /** Absolute fill so image overlays the placeholder exactly */
+  heroImageAbsolute: {
+    width: "100%",
+    height: "100%",
   },
   heroFallback: {
     width: "100%",

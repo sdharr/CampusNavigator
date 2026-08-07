@@ -6,19 +6,16 @@ import {
   TouchableOpacity,
   Alert,
   Animated,
-  ActivityIndicator,
   StatusBar,
   Platform,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { addLocationRoadEdge } from "./services/locationRoadEdgeService";
-import { buildGraph, Graph } from "./services/graphService";
+import { Graph } from "./services/graphService";
 import { dijkstra } from "./services/dijkstraService";
 import { findAlternativeRoutes } from "./services/alternativeRouteService";
 import { addRoadEdge } from "./services/roadEdgeService";
-import { getLocations } from "./services/locationService";
 import {
-  getRoadNodes,
   RoadNode,
 } from "./services/roadNodeService";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -31,6 +28,9 @@ import {
   buildVirtualGraph,
   GPS_VIRTUAL_NODE_ID,
 } from "./services/liveRouteService";
+import { useCampusData } from "./context/CampusDataContext";
+import GraphLoadingChip from "./components/GraphLoadingChip";
+import FindingRoutePanel from "./components/FindingRoutePanel";
 
 import {
   Map,
@@ -164,8 +164,13 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   const cameraRef = useRef<CameraRef>(null);
   const mapRef = useRef<MapRef>(null);
 
-  const [locations, setLocations] = useState<CampusLocation[]>([]);
-  const [roadNodes, setRoadNodes] = useState<RoadNode[]>([]);
+  // ---------------------------------------------------------------------------
+  // Campus data from the shared context (eliminates 5 Firestore reads per open)
+  // ---------------------------------------------------------------------------
+  const { isReady: isCampusReady, data: campusData } = useCampusData();
+  const locations = (campusData?.locations ?? []) as CampusLocation[];
+  const roadNodes = (campusData?.roadNodes ?? []) as RoadNode[];
+
   const [developerMode, setDeveloperMode] = useState(false);
   const [selectedNode1, setSelectedNode1] = useState<RoadNode | null>(null);
   const [selectedNode2, setSelectedNode2] = useState<RoadNode | null>(null);
@@ -206,6 +211,8 @@ export default function MapScreenOSM({ route, navigation }: Props) {
 
   const [isFollowingUser, setIsFollowingUser] = useState(false);
   const [isFindingRoute, setIsFindingRoute] = useState(false);
+  // Derived from the context — true once campusDataService has resolved.
+  const isGraphReady = isCampusReady;
 
   // -- Live GPS watcher refs --
   const locationWatcherRef = useRef<ExpoLocation.LocationSubscription | null>(null);
@@ -215,13 +222,50 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   const isOutsideCampusRef = useRef<boolean>(false);
   const lastGpsRef = useRef<{ latitude: number; longitude: number } | null>(null);
   const roadNodesRef = useRef<RoadNode[]>([]);
+  // Tracks the last route.params object we have already processed so that
+  // React Navigation re-creating the params reference (due to MapScreenOSM's
+  // own state updates) does not re-fire the camera flyTo and override the
+  // fitBounds animation issued by findRoute().
+  const lastProcessedParamsRef = useRef<typeof route.params>(undefined);
+  // If the user presses Find Route before the graph has finished loading,
+  // we store the intent here and flush it the moment isGraphReady flips.
+  const pendingRouteRef = useRef<boolean>(false);
 
-  // Keep roadNodesRef in sync with state
+  // ---------------------------------------------------------------------------
+  // Sync refs from context data the moment campus data becomes ready.
+  // This replaces the old loadData() useEffect that issued 5 Firestore reads.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    roadNodesRef.current = roadNodes;
-  }, [roadNodes]);
+    if (!isCampusReady || !campusData) return;
 
-  useEffect(() => { loadData(); }, []);
+    graphRef.current = campusData.graph;
+    roadNodesRef.current = campusData.roadNodes;
+    coordinateMapRef.current = campusData.coordinateMap;
+
+    // Focus campus after data is ready
+    focusCampus();
+
+    // If opened with a pin intent, fly to it now that the camera is stable
+    const params = route.params;
+    if (params?.intent === "pin") {
+      const loc = params.location;
+      if (typeof loc.latitude === "number" && typeof loc.longitude === "number") {
+        cameraRef.current?.flyTo({
+          center: [loc.longitude, loc.latitude],
+          zoom: 18,
+          duration: 800,
+        });
+      }
+    }
+
+    // Flush a queued Find Route tap
+    if (pendingRouteRef.current) {
+      pendingRouteRef.current = false;
+      console.log("[INIT] campus data ready — flushing queued findRoute call");
+      findRoute();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCampusReady]);
 
   // Stop the GPS watcher when the screen is unmounted
   useEffect(() => { return () => { locationWatcherRef.current?.remove(); }; }, []);
@@ -236,12 +280,21 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     }).start();
   }, [routeCoordinates.length]);
 
+  // (Removed: the isGraphReady flush useEffect is now handled inside the
+  // isCampusReady useEffect above, keeping everything in one place.)
+
   // ---------------------------------------------------------------------------
   // Handle incoming route.params from LocationPickerScreen
   // ---------------------------------------------------------------------------
   useEffect(() => {
     const params = route.params;
     if (!params) return;
+    // Skip if this is the same params object we already handled. React Navigation
+    // may recreate the params reference when the navigator re-renders due to
+    // state changes in MapScreenOSM — without this guard the flyTo below fires
+    // again and cancels the fitBounds animation from findRoute().
+    if (params === lastProcessedParamsRef.current) return;
+    lastProcessedParamsRef.current = params;
 
     if (params.intent === "from") {
       const loc = params.location;
@@ -299,38 +352,8 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     }
   }, [route.params]);
 
-  async function loadData() {
-    try {
-      const locationData = (await getLocations()) as CampusLocation[];
-      setLocations(locationData);
-      const nodeData = await getRoadNodes();
-      setRoadNodes(nodeData);
-      roadNodesRef.current = nodeData;
-      const graph = await buildGraph();
-      graphRef.current = graph;
-      const coordMap: Record<string, { latitude: number; longitude: number }> = {};
-      for (const loc of locationData) { coordMap[loc.id] = { latitude: loc.latitude, longitude: loc.longitude }; }
-      for (const node of nodeData) { coordMap[node.id] = { latitude: node.latitude, longitude: node.longitude }; }
-      coordinateMapRef.current = coordMap;
-
-      // Focus campus after data loads
-      focusCampus();
-
-      // If opened with a pin intent from PlaceDetailScreen, focus on it after data loads
-      const params = route.params;
-      if (params?.intent === "pin") {
-        const loc = params.location;
-        setPinLocation(loc as CampusLocation);
-        if (typeof loc.latitude === "number" && typeof loc.longitude === "number") {
-          cameraRef.current?.flyTo({
-            center: [loc.longitude, loc.latitude],
-            zoom: 18,
-            duration: 800,
-          });
-        }
-      }
-    } catch (error) { console.log(error); }
-  }
+  // loadData() removed: all data now comes from CampusDataContext.
+  // See the isCampusReady useEffect above for ref-sync + focusCampus logic.
 
   function focusCampus() {
     // Fly to the fixed campus centre at zoom 16 — matches the initialViewState
@@ -455,168 +478,251 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   // findRoute
   // ---------------------------------------------------------------------------
   async function findRoute() {
-    if (isFindingRoute) return;
-    console.log("[findRoute] 1. Find Route started");
-
-    if (!from || !to) {
-      Alert.alert("Missing Selection", "Please select both locations.");
-      return;
-    }
-
-    const isCurrentLocation = from === "current-location" && startLocation?.id === "current-location";
-
-    if (isCurrentLocation) {
-      try {
-        // ── Spinner ON: only while waiting for GPS I/O ──
-        setIsFindingRoute(true);
-
-        console.log("[findRoute] 2. Before requesting location permission");
-        const { status } = await ExpoLocation.requestForegroundPermissionsAsync();
-        if (status !== "granted") {
-          Alert.alert("Permission Needed", "Allow location access to calculate the route.");
-          setIsFindingRoute(false);
-          return;
-        }
-        console.log("[findRoute] 3. After permission granted, status:", status);
-
-        let pos: ExpoLocation.LocationObject;
-        console.log("[findRoute] 4. Before getCurrentPositionAsync()");
-        try {
-          pos = await ExpoLocation.getCurrentPositionAsync({ accuracy: ExpoLocation.Accuracy.High });
-        } catch {
-          pos = await ExpoLocation.getCurrentPositionAsync({ accuracy: ExpoLocation.Accuracy.Balanced });
-        }
-        console.log("[findRoute] 5. After getCurrentPositionAsync(), lat:", pos.coords.latitude, "lon:", pos.coords.longitude);
-
-        // ── Spinner OFF: GPS coordinates obtained, rest is synchronous ──
-        setIsFindingRoute(false);
-
-        const gpsLat = pos.coords.latitude;
-        const gpsLon = pos.coords.longitude;
-        const gpsCoord = { latitude: gpsLat, longitude: gpsLon };
-
-        const freshCurrentLocation: CampusLocation = {
-          id: "current-location",
-          name: "Current Location",
-          description: "Live device location",
-          latitude: gpsLat,
-          longitude: gpsLon,
-        };
-        setStartLocation(freshCurrentLocation);
-
-        const isInside = isInsideCampus(gpsLat, gpsLon);
-        setCurrentLocationCampusStatus(isInside ? "inside" : "outside");
-
-        let connNodeId: string;
-        let connNodeCoord: { latitude: number; longitude: number };
-
-        if (!isInside) {
-          const mainGate = locations.find((loc) => loc.name === "Main Gate");
-          if (!mainGate) {
-            Alert.alert("Entrance Not Found", "Could not find the 'Main Gate' location.");
-            clearRoute();
-            return;
-          }
-          if (!graphRef.current[mainGate.id]) {
-            Alert.alert("Entrance Not Connected", "The Main Gate location is not yet connected to the campus road graph.");
-            clearRoute();
-            return;
-          }
-          connNodeId = mainGate.id;
-          connNodeCoord = { latitude: mainGate.latitude, longitude: mainGate.longitude };
-        } else {
-          const connection = findValidConnectionNode(gpsLat, gpsLon, roadNodesRef.current, graphRef.current);
-          if (!connection) {
-            Alert.alert("No Road Node Nearby", `You are inside the campus but no road node was found within ${GPS_MAX_INSIDE_RADIUS_METERS} m.`);
-            clearRoute();
-            return;
-          }
-          connNodeId = connection.id;
-          connNodeCoord = connection.coord;
-        }
-
-        const accessDist = haversineDistance(gpsLat, gpsLon, connNodeCoord.latitude, connNodeCoord.longitude);
-        const virtualGraph = buildVirtualGraph(graphRef.current, connNodeId, accessDist);
-
-        coordinateMapRef.current[GPS_VIRTUAL_NODE_ID] = gpsCoord;
-        console.log("[findRoute] 6. Before Dijkstra, from:", GPS_VIRTUAL_NODE_ID, "to:", to);
-        const path = dijkstra(virtualGraph, GPS_VIRTUAL_NODE_ID, to);
-        const routePaths = findAlternativeRoutes(virtualGraph, path);
-        delete coordinateMapRef.current[GPS_VIRTUAL_NODE_ID];
-        console.log("[findRoute] 7. After Dijkstra, path.length:", path.length);
-
-        if (path.length < 2) {
-          Alert.alert("No Route Found", "Could not find a route from your location to the destination.");
-          clearRoute();
-          return;
-        }
-
-        const campusPath = path.slice(1);
-        const campusCoords = campusPath
-          .map((id) => coordinateMapRef.current[id])
-          .filter(Boolean) as { latitude: number; longitude: number }[];
-
-        const altCampusOptions = routePaths
-          .slice(1)
-          .map((altPath) =>
-            altPath.slice(1).map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[]
-          )
-          .filter((coords) => coords.length >= 1);
-
-        const allRouteOptions = [campusCoords, ...altCampusOptions];
-        setRouteOptions(allRouteOptions);
-        setSelectedRouteIndex(0);
-        console.log("[findRoute] 8. Before setRouteCoordinates(), campusCoords.length:", campusCoords.length);
-        setRouteCoordinates(campusCoords);
-        setNavPhase(NavigationPhase.ROUTE_PREVIEW);
-
-        computeRouteStats([gpsCoord, ...campusCoords]);
-
-        const allVisibleCoords = [gpsCoord, ...campusCoords];
-        fitMapToCoords(allVisibleCoords);
-
-        connectionNodeIdRef.current = connNodeId;
-        connectionNodeCoordRef.current = connNodeCoord;
-        destinationRef.current = to;
-        isOutsideCampusRef.current = !isInside;
-        lastGpsRef.current = gpsCoord;
-        console.log("[findRoute] 9. Before setIsFindingRoute(false) — GPS path success");
-        console.log("[findRoute] 10. End of function — GPS path");
-        return;
-      } catch (error) {
-        console.log("findRoute GPS error:", error);
-        Alert.alert("GPS Error", "Could not obtain your current location. Please try again.");
-        setIsFindingRoute(false);
+    console.log("[FR] ENTER isFindingRoute=", isFindingRoute, "from=", from, "to=", to, "isGraphReady=", isGraphReady);
+    try {
+      // ── Guard: graph not yet loaded — queue the call and return ──────────────
+      // The useEffect([isGraphReady]) flush will call findRoute() again the
+      // instant buildGraph() resolves. No second tap needed.
+      if (!isGraphReady) {
+        console.log("[FR] GRAPH-NOT-READY: queuing findRoute — will auto-run when graph loads");
+        pendingRouteRef.current = true;
         return;
       }
-    }
+      // ── Guard: spinner already running ──────────────────────────────────────
+      console.log("[FR] A. checking isFindingRoute guard");
+      if (isFindingRoute) {
+        console.log("[FR] A-RETURN: isFindingRoute is true — early exit");
+        return;
+      }
+      console.log("[FR] A-PASS: isFindingRoute is false");
 
-    // Normal campus→campus route — no spinner, runs synchronously
-    const end = locations.find((item) => item.id === to) || null;
-    setEndLocation(end);
+      console.log("[findRoute] 1. Find Route started");
 
-    console.log("[findRoute] 6. Before Dijkstra (campus), from:", from, "to:", to);
-    const path = dijkstra(graphRef.current, from, to);
-    console.log("[findRoute] 7. After Dijkstra (campus), path.length:", path.length);
-    if (path.length < 2) {
-      Alert.alert("No Route Found", "Could not find a route between these locations.");
-      clearRoute();
-      return;
+      // ── Guard: from/to missing ───────────────────────────────────────────────
+      console.log("[FR] B. checking from/to guard: from=", from, " to=", to);
+      if (!from || !to) {
+        console.log("[FR] B-RETURN: from or to is null/empty — showing alert");
+        Alert.alert("Missing Selection", "Please select both locations.");
+        return;
+      }
+      console.log("[FR] B-PASS: both from and to are set");
+
+      const isCurrentLocation = from === "current-location" && startLocation?.id === "current-location";
+      console.log("[FR] C. isCurrentLocation=", isCurrentLocation);
+
+      // ════════════════════════════════════════════════════════════════════════
+      // GPS / Current-Location branch
+      // ════════════════════════════════════════════════════════════════════════
+      if (isCurrentLocation) {
+        console.log("[FR] GPS-BRANCH: entering GPS path");
+        try {
+          setIsFindingRoute(true);
+          console.log("[FR] GPS-1: setIsFindingRoute(true) done");
+
+          console.log("[findRoute] 2. Before requesting location permission");
+          console.log("[FR] GPS-2-PRE-AWAIT: about to await requestForegroundPermissionsAsync");
+          const { status } = await ExpoLocation.requestForegroundPermissionsAsync();
+          console.log("[FR] GPS-2-POST-AWAIT: requestForegroundPermissionsAsync resolved, status=", status);
+
+          console.log("[findRoute] 3. After permission granted, status:", status);
+          console.log("[FR] GPS-3: checking permission status");
+          if (status !== "granted") {
+            console.log("[FR] GPS-3-RETURN: permission denied — showing alert");
+            Alert.alert("Permission Needed", "Allow location access to calculate the route.");
+            setIsFindingRoute(false);
+            return;
+          }
+          console.log("[FR] GPS-3-PASS: permission granted");
+
+          let pos: ExpoLocation.LocationObject;
+          console.log("[findRoute] 4. Before getCurrentPositionAsync()");
+          console.log("[FR] GPS-4-PRE-AWAIT-HIGH: about to await getCurrentPositionAsync(High)");
+          try {
+            pos = await ExpoLocation.getCurrentPositionAsync({ accuracy: ExpoLocation.Accuracy.High });
+            console.log("[FR] GPS-4-POST-AWAIT-HIGH: resolved OK");
+          } catch (e) {
+            console.log("[FR] GPS-4-HIGH-CATCH: High accuracy failed, falling back to Balanced. Error:", e);
+            console.log("[FR] GPS-4-PRE-AWAIT-BALANCED: about to await getCurrentPositionAsync(Balanced)");
+            pos = await ExpoLocation.getCurrentPositionAsync({ accuracy: ExpoLocation.Accuracy.Balanced });
+            console.log("[FR] GPS-4-POST-AWAIT-BALANCED: resolved OK");
+          }
+          console.log("[findRoute] 5. After getCurrentPositionAsync(), lat:", pos.coords.latitude, "lon:", pos.coords.longitude);
+
+          setIsFindingRoute(false);
+          console.log("[FR] GPS-5: setIsFindingRoute(false) done");
+
+          const gpsLat = pos.coords.latitude;
+          const gpsLon = pos.coords.longitude;
+          const gpsCoord = { latitude: gpsLat, longitude: gpsLon };
+
+          const freshCurrentLocation: CampusLocation = {
+            id: "current-location",
+            name: "Current Location",
+            description: "Live device location",
+            latitude: gpsLat,
+            longitude: gpsLon,
+          };
+          setStartLocation(freshCurrentLocation);
+
+          const isInside = isInsideCampus(gpsLat, gpsLon);
+          setCurrentLocationCampusStatus(isInside ? "inside" : "outside");
+          console.log("[FR] GPS-6: isInside=", isInside);
+
+          let connNodeId: string;
+          let connNodeCoord: { latitude: number; longitude: number };
+
+          if (!isInside) {
+            console.log("[FR] GPS-7: outside campus — looking for Main Gate");
+            const mainGate = locations.find((loc) => loc.name === "Main Gate");
+            if (!mainGate) {
+              console.log("[FR] GPS-7-RETURN: Main Gate not found");
+              Alert.alert("Entrance Not Found", "Could not find the 'Main Gate' location.");
+              clearRoute();
+              return;
+            }
+            if (!graphRef.current[mainGate.id]) {
+              console.log("[FR] GPS-7-RETURN: Main Gate not connected to graph");
+              Alert.alert("Entrance Not Connected", "The Main Gate location is not yet connected to the campus road graph.");
+              clearRoute();
+              return;
+            }
+            connNodeId = mainGate.id;
+            connNodeCoord = { latitude: mainGate.latitude, longitude: mainGate.longitude };
+            console.log("[FR] GPS-7-PASS: using Main Gate as connection node");
+          } else {
+            console.log("[FR] GPS-8: inside campus — finding nearest road node");
+            const connection = findValidConnectionNode(gpsLat, gpsLon, roadNodesRef.current, graphRef.current);
+            if (!connection) {
+              console.log("[FR] GPS-8-RETURN: no road node nearby");
+              Alert.alert("No Road Node Nearby", `You are inside the campus but no road node was found within ${GPS_MAX_INSIDE_RADIUS_METERS} m.`);
+              clearRoute();
+              return;
+            }
+            connNodeId = connection.id;
+            connNodeCoord = connection.coord;
+            console.log("[FR] GPS-8-PASS: connection node=", connNodeId);
+          }
+
+          const accessDist = haversineDistance(gpsLat, gpsLon, connNodeCoord.latitude, connNodeCoord.longitude);
+          const virtualGraph = buildVirtualGraph(graphRef.current, connNodeId, accessDist);
+          console.log("[FR] GPS-9: virtualGraph built, accessDist=", accessDist);
+
+          coordinateMapRef.current[GPS_VIRTUAL_NODE_ID] = gpsCoord;
+          console.log("[findRoute] 6. Before Dijkstra, from:", GPS_VIRTUAL_NODE_ID, "to:", to);
+          console.log("[FR] GPS-10-PRE: running dijkstra");
+          const path = dijkstra(virtualGraph, GPS_VIRTUAL_NODE_ID, to);
+          console.log("[FR] GPS-10-POST: dijkstra done");
+          const routePaths = findAlternativeRoutes(virtualGraph, path);
+          delete coordinateMapRef.current[GPS_VIRTUAL_NODE_ID];
+          console.log("[findRoute] 7. After Dijkstra, path.length:", path.length);
+
+          if (path.length < 2) {
+            console.log("[FR] GPS-11-RETURN: path too short, no route found");
+            Alert.alert("No Route Found", "Could not find a route from your location to the destination.");
+            clearRoute();
+            return;
+          }
+          console.log("[FR] GPS-11-PASS: valid path found, length=", path.length);
+
+          const campusPath = path.slice(1);
+          const campusCoords = campusPath
+            .map((id) => coordinateMapRef.current[id])
+            .filter(Boolean) as { latitude: number; longitude: number }[];
+
+          const altCampusOptions = routePaths
+            .slice(1)
+            .map((altPath) =>
+              altPath.slice(1).map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[]
+            )
+            .filter((coords) => coords.length >= 1);
+
+          const allRouteOptions = [campusCoords, ...altCampusOptions];
+          setRouteOptions(allRouteOptions);
+          setSelectedRouteIndex(0);
+          console.log("[findRoute] 8. Before setRouteCoordinates(), campusCoords.length:", campusCoords.length);
+          setRouteCoordinates(campusCoords);
+          setNavPhase(NavigationPhase.ROUTE_PREVIEW);
+          computeRouteStats([gpsCoord, ...campusCoords]);
+
+          const allVisibleCoords = [gpsCoord, ...campusCoords];
+          fitMapToCoords(allVisibleCoords);
+          console.log("[FR] GPS-12: fitMapToCoords called");
+
+          connectionNodeIdRef.current = connNodeId;
+          connectionNodeCoordRef.current = connNodeCoord;
+          destinationRef.current = to;
+          isOutsideCampusRef.current = !isInside;
+          lastGpsRef.current = gpsCoord;
+          console.log("[findRoute] 9. Before setIsFindingRoute(false) — GPS path success");
+          console.log("[findRoute] 10. End of function — GPS path");
+          console.log("[FR] GPS-RETURN-SUCCESS: returning normally");
+          return;
+        } catch (error) {
+          console.log("[FR] GPS-CATCH: caught error in GPS branch:", error);
+          console.log("findRoute GPS error:", error);
+          Alert.alert("GPS Error", "Could not obtain your current location. Please try again.");
+          setIsFindingRoute(false);
+          console.log("[FR] GPS-CATCH-RETURN: returning after GPS error");
+          return;
+        }
+      }
+
+      // ════════════════════════════════════════════════════════════════════════
+      // Campus-to-campus branch (synchronous)
+      // ════════════════════════════════════════════════════════════════════════
+      console.log("[FR] CAMPUS-BRANCH: entering campus-to-campus path");
+
+      console.log("[FR] CAMPUS-1: locations.length=", locations.length, "  looking up to=", to);
+      const end = locations.find((item) => item.id === to) || null;
+      console.log("[FR] CAMPUS-1-RESULT: end=", end ? end.name : "null");
+      setEndLocation(end);
+
+      console.log("[findRoute] 6. Before Dijkstra (campus), from:", from, "to:", to);
+      console.log("[FR] CAMPUS-2-PRE: graphRef.current keys count=", Object.keys(graphRef.current).length);
+      const path = dijkstra(graphRef.current, from, to);
+      console.log("[findRoute] 7. After Dijkstra (campus), path.length:", path.length);
+      console.log("[FR] CAMPUS-2-POST: dijkstra returned path=", JSON.stringify(path));
+
+      console.log("[FR] CAMPUS-3: checking path length < 2");
+      if (path.length < 2) {
+        console.log("[FR] CAMPUS-3-RETURN: path too short, showing No Route Found alert");
+        Alert.alert("No Route Found", "Could not find a route between these locations.");
+        clearRoute();
+        return;
+      }
+      console.log("[FR] CAMPUS-3-PASS: path is valid, length=", path.length);
+
+      console.log("[FR] CAMPUS-4: computing alternative routes");
+      const routePaths = findAlternativeRoutes(graphRef.current, path);
+      console.log("[FR] CAMPUS-4-DONE: routePaths.length=", routePaths.length);
+
+      console.log("[FR] CAMPUS-5: mapping path to coordinates, coordinateMapRef keys=", Object.keys(coordinateMapRef.current).length);
+      const pathCoordinates = path.map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[];
+      console.log("[FR] CAMPUS-5-DONE: pathCoordinates.length=", pathCoordinates.length, " (path had", path.length, "nodes)");
+
+      const alternativeRouteCoordinates = routePaths.slice(1).map((routePath) => {
+        const coordinates = routePath.map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[];
+        return coordinates.length === routePath.length ? coordinates : null;
+      }).filter((coordinates): coordinates is { latitude: number; longitude: number }[] => coordinates !== null);
+      console.log("[FR] CAMPUS-6: alternativeRouteCoordinates.length=", alternativeRouteCoordinates.length);
+
+      const availableRouteOptions = [pathCoordinates, ...alternativeRouteCoordinates];
+      setRouteOptions(availableRouteOptions);
+      setSelectedRouteIndex(0);
+      setNavPhase(NavigationPhase.ROUTE_PREVIEW);
+      console.log("[findRoute] 8. Before setRouteCoordinates() (campus), pathCoordinates.length:", pathCoordinates.length);
+      console.log("[FR] CAMPUS-7-PRE: about to call displayRoute");
+      displayRoute(pathCoordinates);
+      console.log("[FR] CAMPUS-7-POST: displayRoute returned");
+      console.log("[findRoute] 9. Before setIsFindingRoute(false) — campus path success");
+      console.log("[findRoute] 10. End of function — campus path");
+      console.log("[FR] CAMPUS-RETURN-SUCCESS: returning normally");
+    } catch (e) {
+      console.error("[FR] UNCAUGHT exception in findRoute:", e);
+      throw e;
+    } finally {
+      console.log("[FR] FINALLY: findRoute exiting");
     }
-    const routePaths = findAlternativeRoutes(graphRef.current, path);
-    const pathCoordinates = path.map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[];
-    const alternativeRouteCoordinates = routePaths.slice(1).map((routePath) => {
-      const coordinates = routePath.map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[];
-      return coordinates.length === routePath.length ? coordinates : null;
-    }).filter((coordinates): coordinates is { latitude: number; longitude: number }[] => coordinates !== null);
-    const availableRouteOptions = [pathCoordinates, ...alternativeRouteCoordinates];
-    setRouteOptions(availableRouteOptions);
-    setSelectedRouteIndex(0);
-    setNavPhase(NavigationPhase.ROUTE_PREVIEW);
-    console.log("[findRoute] 8. Before setRouteCoordinates() (campus), pathCoordinates.length:", pathCoordinates.length);
-    displayRoute(pathCoordinates);
-    console.log("[findRoute] 9. Before setIsFindingRoute(false) — campus path success");
-    console.log("[findRoute] 10. End of function — campus path");
   }
 
   // ---------------------------------------------------------------------------
@@ -923,8 +1029,13 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   // ---------------------------------------------------------------------------
   // GeoJSON data for map layers
   // ---------------------------------------------------------------------------
-  const mainRouteGeoJSON: GeoJSON.Feature<GeoJSON.LineString> | null =
-    routeCoordinates.length > 1 ? coordsToLineGeoJSON(routeCoordinates) : null;
+  // Always a FeatureCollection so the GeoJSONSource stays mounted across renders.
+  // Switching from null→Feature caused conditional mount/unmount, which meant
+  // the first click registered a brand-new native source (async) while fitBounds
+  // was already animating — the layer missed the first render frame.
+  const mainRouteGeoJSON: GeoJSON.FeatureCollection = routeCoordinates.length > 1
+    ? { type: "FeatureCollection", features: [coordsToLineGeoJSON(routeCoordinates)] }
+    : { type: "FeatureCollection", features: [] };
 
   const altRoutesGeoJSON: GeoJSON.FeatureCollection =
     routeOptions.length > 1
@@ -1005,25 +1116,26 @@ export default function MapScreenOSM({ route, navigation }: Props) {
           </GeoJSONSource>
         )}
 
-        {/* Main/selected route — white casing beneath blue fill */}
-        {mainRouteGeoJSON && (
-          <GeoJSONSource id="main-route-source" data={mainRouteGeoJSON}>
-            {/* Casing: wider white stroke rendered first (bottom) */}
-            <Layer
-              id="main-route-casing"
-              type="line"
-              paint={{ "line-color": "#FFFFFF", "line-width": 9, "line-opacity": 0.9 }}
-              layout={{ "line-cap": "round", "line-join": "round" }}
-            />
-            {/* Fill: blue stroke rendered on top */}
-            <Layer
-              id="main-route-layer"
-              type="line"
-              paint={{ "line-color": "#1565C0", "line-width": 5 }}
-              layout={{ "line-cap": "round", "line-join": "round" }}
-            />
-          </GeoJSONSource>
-        )}
+        {/* Main/selected route — white casing beneath blue fill.
+             Always mounted so React updates data on the existing native source
+             rather than registering a new one (which caused the first-click
+             render miss). An empty FeatureCollection hides the layers naturally. */}
+        <GeoJSONSource id="main-route-source" data={mainRouteGeoJSON}>
+          {/* Casing: wider white stroke rendered first (bottom) */}
+          <Layer
+            id="main-route-casing"
+            type="line"
+            paint={{ "line-color": "#FFFFFF", "line-width": 9, "line-opacity": 0.9 }}
+            layout={{ "line-cap": "round", "line-join": "round" }}
+          />
+          {/* Fill: blue stroke rendered on top */}
+          <Layer
+            id="main-route-layer"
+            type="line"
+            paint={{ "line-color": "#1565C0", "line-width": 5 }}
+            layout={{ "line-cap": "round", "line-join": "round" }}
+          />
+        </GeoJSONSource>
 
         {/* GPS access segment (dashed orange) */}
         {accessSegmentGeoJSON && (
@@ -1252,16 +1364,20 @@ export default function MapScreenOSM({ route, navigation }: Props) {
 
               {/* ── Row 2: Find Route ── */}
               <TouchableOpacity
-                style={[styles.findRouteButton, isFindingRoute && styles.findRouteButtonDisabled]}
+                style={[
+                  styles.findRouteButton,
+                  isFindingRoute && styles.findRouteButtonDisabled,
+                ]}
                 onPress={findRoute}
                 activeOpacity={0.85}
                 disabled={isFindingRoute}
               >
-                {isFindingRoute ? (
-                  <ActivityIndicator size="small" color="#1565C0" style={{ marginRight: 6 }} />
-                ) : (
-                  <Ionicons name="navigate" size={16} color="#1565C0" style={{ marginRight: 6 }} />
-                )}
+                <Ionicons
+                  name="navigate"
+                  size={16}
+                  color="#1565C0"
+                  style={{ marginRight: 6 }}
+                />
                 <Text style={styles.findRouteButtonText}>
                   {isFindingRoute ? "Finding Route…" : "Find Route"}
                 </Text>
@@ -1270,16 +1386,7 @@ export default function MapScreenOSM({ route, navigation }: Props) {
           </SafeAreaView>
         )}
 
-        {/* Walking pill — floats just below the header */}
-        {!isNavigating && !isArrived && (
-          <View style={[styles.walkingPillWrapper, { top: headerHeight + 12 }]}>
-            <TouchableOpacity style={styles.walkingPill} activeOpacity={0.85}>
-              <MaterialCommunityIcons name="walk" size={18} color="#1565C0" />
-              <Text style={styles.walkingPillText}>Walking</Text>
-              <Ionicons name="chevron-forward" size={14} color="#1565C0" style={{ marginLeft: 2 }} />
-            </TouchableOpacity>
-          </View>
-        )}
+
 
         {/* Developer tools panel */}
         {DEV_MODE && (
@@ -1358,6 +1465,18 @@ export default function MapScreenOSM({ route, navigation }: Props) {
             </TouchableOpacity>
           </View>
         )}
+
+
+        {/* ── Finding-route bottom panel — shown while GPS fix is in progress ── */}
+        <FindingRoutePanel
+          visible={isFindingRoute}
+          onCancel={() => setIsFindingRoute(false)}
+          label={
+            from === "current-location"
+              ? "Getting your location…"
+              : "Calculating route…"
+          }
+        />
 
       </View>{/* end overlay container */}
     </View>
@@ -1461,14 +1580,7 @@ const styles = StyleSheet.create({
   findRouteButtonText: { color: BLUE_PRIMARY, fontWeight: "700", fontSize: 14, letterSpacing: 0.3 },
   findRouteButtonDisabled: { opacity: 0.55 },
 
-  // -- Walking Pill -------------------------------------------------------------
-  walkingPillWrapper: { position: "absolute", left: 14 },
-  walkingPill: {
-    flexDirection: "row", alignItems: "center", backgroundColor: "#fff",
-    borderRadius: 20, paddingHorizontal: 14, paddingVertical: 8, gap: 6,
-    shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.12, shadowRadius: 5, elevation: 5,
-  },
-  walkingPillText: { color: "#1A1A2E", fontWeight: "600", fontSize: 13 },
+
 
   // -- Navigation Bar (NAVIGATING / ARRIVED state) ------------------------------
   navBarSafeArea: {

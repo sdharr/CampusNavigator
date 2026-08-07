@@ -10,13 +10,16 @@ export type Graph = {
   [nodeId: string]: GraphEdge[];
 };
 
-export async function buildGraph(): Promise<Graph> {
-  const roadEdges: RoadEdge[] = await getRoadEdges();
-  const locationEdges: LocationRoadEdge[] = await getLocationRoadEdges();
-
+// ---------------------------------------------------------------------------
+// Pure (synchronous) graph builder — accepts already-fetched data.
+// Used by campusDataService so that Firestore is only hit once.
+// ---------------------------------------------------------------------------
+export function buildGraphFromData(
+  roadEdges: RoadEdge[],
+  locationEdges: LocationRoadEdge[]
+): Graph {
   const graph: Graph = {};
 
-  // Helper to safely initialise a node in the graph
   function ensureNode(nodeId: string) {
     if (!graph[nodeId]) {
       graph[nodeId] = [];
@@ -53,4 +56,14 @@ export async function buildGraph(): Promise<Graph> {
   }
 
   return graph;
+}
+
+// ---------------------------------------------------------------------------
+// Async wrapper kept for backward compatibility with any call sites that
+// still need to fetch + build in one shot (e.g. standalone scripts).
+// ---------------------------------------------------------------------------
+export async function buildGraph(): Promise<Graph> {
+  const roadEdges: RoadEdge[] = await getRoadEdges();
+  const locationEdges: LocationRoadEdge[] = await getLocationRoadEdges();
+  return buildGraphFromData(roadEdges, locationEdges);
 }

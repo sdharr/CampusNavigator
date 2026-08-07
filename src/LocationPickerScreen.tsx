@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 
 import {
   SafeAreaView,
@@ -15,29 +15,22 @@ import { Ionicons } from "@expo/vector-icons";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 import * as ExpoLocation from "expo-location";
 
-import { getLocations } from "./services/locationService";
+import { useCampusData } from "./context/CampusDataContext";
 import { CampusLocation, RootStackParamList } from "./navigation/AppNavigator";
+import SkeletonCard from "./components/SkeletonCard";
 
 type Props = NativeStackScreenProps<RootStackParamList, "LocationPicker">;
 
+// Number of skeleton cards to show while data loads.
+const SKELETON_COUNT = 7;
+
 export default function LocationPickerScreen({ navigation, route }: Props) {
 
-  const [locations, setLocations] = useState<CampusLocation[]>([]);
+  const { isReady, data } = useCampusData();
+  const locations = (data?.locations ?? []) as CampusLocation[];
+
   const [search, setSearch] = useState("");
   const isFromSelection = route.params?.type === "from";
-
-  useEffect(() => {
-    loadLocations();
-  }, []);
-
-  async function loadLocations() {
-    try {
-      const data = await getLocations();
-      setLocations(data as CampusLocation[]);
-    } catch (error) {
-      console.log(error);
-    }
-  }
 
   async function selectCurrentLocation() {
     try {
@@ -202,65 +195,78 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
             </TouchableOpacity>
           )
         }
-        <FlatList
-          data={filteredLocations}
-          keyExtractor={(item) => item.id}
-          renderItem={({ item }) => (
-            <TouchableOpacity
-              style={{
-                backgroundColor: "white",
-                padding: 16,
-                borderRadius: 12,
-                marginBottom: 10,
-                flexDirection: "row",
-                alignItems: "center",
-              }}
-              onPress={() => {
-                const isFrom = route.params.type === "from";
-                if (isFrom) {
-                  navigation.navigate("Map", {
-                    intent: "from",
-                    location: item,
-                    // Echo back the preserved TO endpoint
-                    preservedTo: route.params.currentTo,
-                  });
-                } else {
-                  navigation.navigate("Map", {
-                    intent: "to",
-                    location: item,
-                    // Echo back the preserved FROM endpoint
-                    preservedFrom: route.params.currentFrom,
-                  });
-                }
-              }}
-            >
-              <Ionicons
-                name={getIcon(item.name)}
-                size={22}
-                color="#1565C0"
 
-              />
+        {/* ── Loading skeleton ── */}
+        {!isReady && (
+          <View>
+            {Array.from({ length: SKELETON_COUNT }).map((_, i) => (
+              <SkeletonCard key={`skeleton-${i}`} />
+            ))}
+          </View>
+        )}
 
-
-              <Text
+        {/* ── Real list — only rendered once data is ready ── */}
+        {isReady && (
+          <FlatList
+            data={filteredLocations}
+            keyExtractor={(item) => item.id}
+            renderItem={({ item }) => (
+              <TouchableOpacity
                 style={{
-                  marginLeft: 12,
-                  flex: 1,
-                  fontSize: 16,
-                  fontWeight: "600",
+                  backgroundColor: "white",
+                  padding: 16,
+                  borderRadius: 12,
+                  marginBottom: 10,
+                  flexDirection: "row",
+                  alignItems: "center",
+                }}
+                onPress={() => {
+                  const isFrom = route.params.type === "from";
+                  if (isFrom) {
+                    navigation.navigate("Map", {
+                      intent: "from",
+                      location: item,
+                      // Echo back the preserved TO endpoint
+                      preservedTo: route.params.currentTo,
+                    });
+                  } else {
+                    navigation.navigate("Map", {
+                      intent: "to",
+                      location: item,
+                      // Echo back the preserved FROM endpoint
+                      preservedFrom: route.params.currentFrom,
+                    });
+                  }
                 }}
               >
-                {item.name}
-              </Text>
+                <Ionicons
+                  name={getIcon(item.name)}
+                  size={22}
+                  color="#1565C0"
 
-              <Ionicons
-                name="chevron-forward"
-                size={18}
-                color="gray"
-              />
-            </TouchableOpacity>
-          )}
-        />
+                />
+
+
+                <Text
+                  style={{
+                    marginLeft: 12,
+                    flex: 1,
+                    fontSize: 16,
+                    fontWeight: "600",
+                  }}
+                >
+                  {item.name}
+                </Text>
+
+                <Ionicons
+                  name="chevron-forward"
+                  size={18}
+                  color="gray"
+                />
+              </TouchableOpacity>
+            )}
+          />
+        )}
       </View>
     </SafeAreaView>
   );
