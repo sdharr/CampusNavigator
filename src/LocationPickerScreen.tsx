@@ -59,10 +59,10 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
         description: "Live device location",
       };
 
-      // navigate() works on React Navigation v6 and v7 alike. When the Map
-      // screen is already in the stack this will update its route.params and
-      // bring it to the front without creating a duplicate entry.
-      navigation.navigate("Map", {
+      // popTo() is the React Navigation v7 NativeStack API that atomically
+      // pops all screens above "Map" (i.e. this Picker) and updates Map's
+      // route.params in a single operation — no ghost picker in the back stack.
+      navigation.popTo("Map", {
         intent: "from",
         location: currentLocation,
         // Echo the preserved TO back so MapScreen can restore both endpoints
@@ -223,14 +223,16 @@ export default function LocationPickerScreen({ navigation, route }: Props) {
                 onPress={() => {
                   const isFrom = route.params.type === "from";
                   if (isFrom) {
-                    navigation.navigate("Map", {
+                    // popTo() pops this Picker and brings Map to the front in
+                    // one atomic step — no ghost Picker entry remains in the stack.
+                    navigation.popTo("Map", {
                       intent: "from",
                       location: item,
                       // Echo back the preserved TO endpoint
                       preservedTo: route.params.currentTo,
                     });
                   } else {
-                    navigation.navigate("Map", {
+                    navigation.popTo("Map", {
                       intent: "to",
                       location: item,
                       // Echo back the preserved FROM endpoint

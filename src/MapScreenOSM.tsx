@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  BackHandler,
   StyleSheet,
   View,
   Text,
@@ -406,6 +407,62 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     destinationRef.current = null;
     lastGpsRef.current = null;
   }
+
+  /**
+   * Full navigation reset — called by the header back button and the Android
+   * hardware back button whenever the screen has meaningful state.
+   *
+   * Clears route, endpoints, and all selection state, then returns the camera
+   * to the default campus overview.  Only falls through to navigation.goBack()
+   * when the screen is already in a fully clean state.
+   */
+  function resetAll() {
+    clearRoute();
+    setFrom(null);
+    setTo(null);
+    setStartLocation(null);
+    setEndLocation(null);
+    setCurrentLocationCampusStatus(null);
+    setPinLocation(null);
+    // Reset the params guard so future navigation events are processed fresh.
+    lastProcessedParamsRef.current = undefined;
+    focusCampus();
+  }
+
+  /** True when the screen holds any state that warrants a reset instead of a
+   *  direct goBack(). Evaluated inside handleBack() and the BackHandler hook. */
+  function hasActiveState() {
+    return (
+      from !== null ||
+      to !== null ||
+      routeCoordinates.length > 0 ||
+      navPhase !== NavigationPhase.IDLE ||
+      pinLocation !== null
+    );
+  }
+
+  /** Shared logic for header back button and Android hardware back button. */
+  function handleBack() {
+    if (hasActiveState()) {
+      resetAll();
+      // Do NOT call navigation.goBack() — we stay on this screen in a clean state.
+    } else {
+      navigation.goBack();
+    }
+  }
+
+  // Intercept the Android hardware back button with the same single-press reset.
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (hasActiveState()) {
+        resetAll();
+        return true; // Consumed — prevents the default goBack()
+      }
+      return false; // Let React Navigation handle it normally
+    });
+    return () => sub.remove();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [from, to, routeCoordinates.length, navPhase, pinLocation]);
 
   function fitMapToCoords(coords: { latitude: number; longitude: number }[], paddingTop = 260, paddingBottom = 220) {
     if (!coords.length) return;
@@ -1303,7 +1360,7 @@ export default function MapScreenOSM({ route, navigation }: Props) {
             onLayout={(e) => setHeaderHeight(e.nativeEvent.layout.height)}
           >
             <View style={styles.titleRow}>
-              <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()} activeOpacity={0.75}>
+              <TouchableOpacity style={styles.backButton} onPress={handleBack} activeOpacity={0.75}>
                 <Ionicons name="arrow-back" size={22} color="#fff" />
               </TouchableOpacity>
               <Text style={styles.headerTitle}>Navigate Campus</Text>
