@@ -69,8 +69,8 @@ const GPS_MAX_INSIDE_RADIUS_METERS = 300;
 const ARRIVAL_THRESHOLD_METERS = 20;
 
 // Campus centre (lon, lat for MapLibre)
-const CAMPUS_CENTER_LNG = 74.866404;
-const CAMPUS_CENTER_LAT = 32.716289;
+const CAMPUS_CENTER_LNG = 74.867680;
+const CAMPUS_CENTER_LAT = 32.717349;
 
 // ---------------------------------------------------------------------------
 // Campus map constraints — derived from CAMPUS_BOUNDARY polygon extremes
@@ -231,6 +231,12 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   // If the user presses Find Route before the graph has finished loading,
   // we store the intent here and flush it the moment isGraphReady flips.
   const pendingRouteRef = useRef<boolean>(false);
+  // True once the native Map view has fired onDidFinishLoadingMap and the
+  // Camera native node is guaranteed to exist.  flyTo/easeTo are silently
+  // dropped before this point (findNodeHandle returns null).
+  const isMapReadyRef = useRef<boolean>(false);
+  // Pin flyTo that arrived before the map was ready — flushed in onDidFinishLoadingMap.
+  const pendingPinFlyRef = useRef<{ longitude: number; latitude: number } | null>(null);
 
   // ---------------------------------------------------------------------------
   // Sync refs from context data the moment campus data becomes ready.
@@ -246,16 +252,22 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     // Focus campus after data is ready
     focusCampus();
 
-    // If opened with a pin intent, fly to it now that the camera is stable
+    // If opened with a pin intent, fly to it once the map is ready.
+    // If the native map isn't ready yet, store it so onDidFinishLoadingMap
+    // can flush it at the correct lifecycle moment.
     const params = route.params;
     if (params?.intent === "pin") {
       const loc = params.location;
       if (typeof loc.latitude === "number" && typeof loc.longitude === "number") {
-        cameraRef.current?.flyTo({
-          center: [loc.longitude, loc.latitude],
-          zoom: 18,
-          duration: 800,
-        });
+        if (isMapReadyRef.current) {
+          cameraRef.current?.flyTo({
+            center: [loc.longitude, loc.latitude],
+            zoom: 18,
+            duration: 800,
+          });
+        } else {
+          pendingPinFlyRef.current = { longitude: loc.longitude, latitude: loc.latitude };
+        }
       }
     }
 
@@ -265,7 +277,7 @@ export default function MapScreenOSM({ route, navigation }: Props) {
       console.log("[INIT] campus data ready — flushing queued findRoute call");
       findRoute();
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCampusReady]);
 
   // Stop the GPS watcher when the screen is unmounted
@@ -344,11 +356,16 @@ export default function MapScreenOSM({ route, navigation }: Props) {
       const loc = params.location;
       setPinLocation(loc);
       if (typeof loc.latitude === "number" && typeof loc.longitude === "number") {
-        cameraRef.current?.flyTo({
-          center: [loc.longitude, loc.latitude],
-          zoom: 18,
-          duration: 1000,
-        });
+        if (isMapReadyRef.current) {
+          cameraRef.current?.flyTo({
+            center: [loc.longitude, loc.latitude],
+            zoom: 18,
+            duration: 1000,
+          });
+        } else {
+          // Map not yet ready — store so onDidFinishLoadingMap can flush it.
+          pendingPinFlyRef.current = { longitude: loc.longitude, latitude: loc.latitude };
+        }
       }
     }
   }, [route.params]);
@@ -361,7 +378,7 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     // below so the idle camera is always consistent regardless of screen size.
     cameraRef.current?.flyTo({
       center: [CAMPUS_CENTER_LNG, CAMPUS_CENTER_LAT],
-      zoom: 16,
+      zoom: 17,
       duration: 1000,
     });
   }
@@ -461,7 +478,7 @@ export default function MapScreenOSM({ route, navigation }: Props) {
       return false; // Let React Navigation handle it normally
     });
     return () => sub.remove();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [from, to, routeCoordinates.length, navPhase, pinLocation]);
 
   function fitMapToCoords(coords: { latitude: number; longitude: number }[], paddingTop = 260, paddingBottom = 220) {
@@ -1125,6 +1142,20 @@ export default function MapScreenOSM({ route, navigation }: Props) {
         attributionPosition={{ bottom: 8, right: 8 }}
         logoPosition={{ bottom: 8, left: 8 }}
         onPress={handleMapPress}
+        onDidFinishLoadingMap={() => {
+          // The native Camera node is now guaranteed to exist — mark ready and
+          // flush any pin flyTo that was queued before the map had initialised.
+          isMapReadyRef.current = true;
+          const pending = pendingPinFlyRef.current;
+          if (pending) {
+            pendingPinFlyRef.current = null;
+            cameraRef.current?.flyTo({
+              center: [pending.longitude, pending.latitude],
+              zoom: 18,
+              duration: 1000,
+            });
+          }
+        }}
         onRegionWillChange={(e) => {
           // Disengage camera follow when user manually pans
           if (e.nativeEvent?.userInteraction && isFollowingUser) {
@@ -1145,33 +1176,36 @@ export default function MapScreenOSM({ route, navigation }: Props) {
           maxBounds={CAMPUS_MAX_BOUNDS}
         />
 
-        {/* Alternative routes (grey). GeoJSONSource onPress delivers the tapped
-             feature (with routeIndex) directly — no queryRenderedFeatures needed.
+        {/* Alternative routes (grey). Always mounted (empty FeatureCollection
+             when there are no alternatives) so MapLibre registers this source's
+             native layer BEFORE main-route-source's layers. Conditional mounting
+             caused the grey layer to be inserted above the blue layer in the GL
+             style stack whenever routeOptions first became available.
+             GeoJSONSource onPress delivers the tapped feature (with routeIndex)
+             directly — no queryRenderedFeatures needed.
              hitbox widens the touch target to 44 × 44 pt around the line. */}
-        {routeOptions.length > 1 && (
-          <GeoJSONSource
-            id="alt-routes-source"
-            data={altRoutesGeoJSON}
-            hitbox={{ top: 22, right: 22, bottom: 22, left: 22 }}
-            onPress={(e) => {
-              const feature = e.nativeEvent.features[0];
-              if (!feature) return;
-              const routeIndex = (feature.properties as { routeIndex?: number } | null)
-                ?.routeIndex;
-              if (typeof routeIndex === "number") {
-                selectRoute(routeIndex);
-                e.stopPropagation(); // don't also fire Map's onPress (would clear pin)
-              }
-            }}
-          >
-            <Layer
-              id="alt-routes-layer"
-              type="line"
-              paint={{ "line-color": "#B0B8C1", "line-width": 4 }}
-              layout={{ "line-cap": "round", "line-join": "round" }}
-            />
-          </GeoJSONSource>
-        )}
+        <GeoJSONSource
+          id="alt-routes-source"
+          data={altRoutesGeoJSON}
+          hitbox={{ top: 22, right: 22, bottom: 22, left: 22 }}
+          onPress={(e) => {
+            const feature = e.nativeEvent.features[0];
+            if (!feature) return;
+            const routeIndex = (feature.properties as { routeIndex?: number } | null)
+              ?.routeIndex;
+            if (typeof routeIndex === "number") {
+              selectRoute(routeIndex);
+              e.stopPropagation(); // don't also fire Map's onPress (would clear pin)
+            }
+          }}
+        >
+          <Layer
+            id="alt-routes-layer"
+            type="line"
+            paint={{ "line-color": "#B0B8C1", "line-width": 4 }}
+            layout={{ "line-cap": "round", "line-join": "round" }}
+          />
+        </GeoJSONSource>
 
         {/* Main/selected route — white casing beneath blue fill.
              Always mounted so React updates data on the existing native source
