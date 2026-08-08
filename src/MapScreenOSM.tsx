@@ -54,8 +54,8 @@ const STREET_STYLE =
 const SATELLITE_STYLE =
   `https://api.maptiler.com/maps/hybrid/style.json?key=${MAPTILER_KEY}`;
 
-// Change this one line to switch styles
-const MAP_STYLE = SATELLITE_STYLE;
+// Default style — toggled at runtime by the floating map-type button.
+const DEFAULT_MAP_STYLE = STREET_STYLE;
 // Toggle developer/editing tools for the whole screen.
 // When false, all dev-only UI is hidden but the underlying
 // functions (connectNodes, connectLocation, etc.) are untouched.
@@ -209,6 +209,17 @@ export default function MapScreenOSM({ route, navigation }: Props) {
 
   const bottomCardAnim = useRef(new Animated.Value(0)).current;
   const [headerHeight, setHeaderHeight] = useState(Platform.OS === "android" ? 220 : 240);
+
+  // ---------------------------------------------------------------------------
+  // Map style toggle: Campus (streets) ↔ Satellite
+  // ---------------------------------------------------------------------------
+  const [activeMapStyle, setActiveMapStyle] = useState(DEFAULT_MAP_STYLE);
+  const isSatellite = activeMapStyle === SATELLITE_STYLE;
+  function toggleMapStyle() {
+    setActiveMapStyle((prev) =>
+      prev === SATELLITE_STYLE ? STREET_STYLE : SATELLITE_STYLE
+    );
+  }
 
   const [isFollowingUser, setIsFollowingUser] = useState(false);
   const [isFindingRoute, setIsFindingRoute] = useState(false);
@@ -1138,7 +1149,7 @@ export default function MapScreenOSM({ route, navigation }: Props) {
       <Map
         ref={mapRef}
         style={StyleSheet.absoluteFillObject}
-        mapStyle={MAP_STYLE}
+        mapStyle={activeMapStyle}
         attributionPosition={{ bottom: 8, right: 8 }}
         logoPosition={{ bottom: 8, left: 8 }}
         onPress={handleMapPress}
@@ -1569,6 +1580,25 @@ export default function MapScreenOSM({ route, navigation }: Props) {
           }
         />
 
+        {/* ── Floating map-style toggle — upper-right, just below header ── */}
+        {!isNavigating && !isArrived && (
+          <TouchableOpacity
+            style={[styles.mapStyleToggle, { top: headerHeight + 8 }]}
+            onPress={toggleMapStyle}
+            activeOpacity={0.82}
+          >
+            <Ionicons
+              name={isSatellite ? "map-outline" : "earth-outline"}
+              size={14}
+              color="#1565C0"
+              style={{ marginRight: 5 }}
+            />
+            <Text style={styles.mapStyleToggleText}>
+              {isSatellite ? "Campus Map" : "Satellite"}
+            </Text>
+          </TouchableOpacity>
+        )}
+
       </View>{/* end overlay container */}
     </View>
   );
@@ -1670,6 +1700,31 @@ const styles = StyleSheet.create({
   },
   findRouteButtonText: { color: BLUE_PRIMARY, fontWeight: "700", fontSize: 14, letterSpacing: 0.3 },
   findRouteButtonDisabled: { opacity: 0.55 },
+
+  // -- Floating map-style toggle ------------------------------------------------
+  mapStyleToggle: {
+    position: "absolute",
+    // top is supplied inline (headerHeight + 8) so the button always sits
+    // immediately below the blue header, matching the old Walking-chip placement.
+    right: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#fff",
+    borderRadius: 20,
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.16,
+    shadowRadius: 5,
+    elevation: 6,
+  },
+  mapStyleToggleText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#1565C0",
+    letterSpacing: 0.2,
+  },
 
 
 
