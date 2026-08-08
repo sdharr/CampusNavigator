@@ -84,6 +84,19 @@ const CAMPUS_MAX_BOUNDS: [number, number, number, number] = [
   74.886, // east  (campus max lng 74.874484 + 0.011°)
   32.731, // north (campus max lat 32.721962 + 0.009°)
 ];
+
+// ---------------------------------------------------------------------------
+// Campus area label — static GeoJSON point at the campus centre.
+// Rendered by MapLibre as a symbol layer so it appears on both map styles.
+// ---------------------------------------------------------------------------
+const CAMPUS_LABEL_GEOJSON: GeoJSON.Feature<GeoJSON.Point> = {
+  type: "Feature",
+  properties: { label: "JAMMU UNIVERSITY" },
+  geometry: {
+    type: "Point",
+    coordinates: [CAMPUS_CENTER_LNG, CAMPUS_CENTER_LAT],
+  },
+};
 /** Minimum zoom: campus stays visible and recognisable (campus spans ~1 km). */
 const CAMPUS_MIN_ZOOM = 13;
 /** Maximum zoom: retain MapTiler's full detail for close-up navigation. */
@@ -1194,7 +1207,13 @@ export default function MapScreenOSM({ route, navigation }: Props) {
              style stack whenever routeOptions first became available.
              GeoJSONSource onPress delivers the tapped feature (with routeIndex)
              directly — no queryRenderedFeatures needed.
-             hitbox widens the touch target to 44 × 44 pt around the line. */}
+             hitbox widens the touch target to 44 × 44 pt around the line.
+             beforeId="main-route-casing" explicitly anchors the grey layer below
+             the white casing on EVERY style (Campus Map + Satellite). Without
+             this constraint a style reload (e.g. toggling to Satellite) can
+             re-register native layers in a different order, causing the grey
+             alt-routes layer to render above the blue main-route layer on shared
+             segments. */}
         <GeoJSONSource
           id="alt-routes-source"
           data={altRoutesGeoJSON}
@@ -1210,9 +1229,11 @@ export default function MapScreenOSM({ route, navigation }: Props) {
             }
           }}
         >
+          {/* beforeId keeps alt-routes BELOW the white casing on both map styles */}
           <Layer
             id="alt-routes-layer"
             type="line"
+            beforeId="main-route-casing"
             paint={{ "line-color": "#B0B8C1", "line-width": 4 }}
             layout={{ "line-cap": "round", "line-join": "round" }}
           />
@@ -1221,16 +1242,22 @@ export default function MapScreenOSM({ route, navigation }: Props) {
         {/* Main/selected route — white casing beneath blue fill.
              Always mounted so React updates data on the existing native source
              rather than registering a new one (which caused the first-click
-             render miss). An empty FeatureCollection hides the layers naturally. */}
+             render miss). An empty FeatureCollection hides the layers naturally.
+             beforeId on main-route-casing keeps it sandwiched below main-route-layer
+             so the stacking order is enforced even after a satellite style reload:
+               alt-routes-layer (grey, bottom)
+               main-route-casing (white, middle)
+               main-route-layer  (blue, top) */}
         <GeoJSONSource id="main-route-source" data={mainRouteGeoJSON}>
-          {/* Casing: wider white stroke rendered first (bottom) */}
+          {/* Casing: wider white stroke — always below the blue fill */}
           <Layer
             id="main-route-casing"
             type="line"
+            beforeId="main-route-layer"
             paint={{ "line-color": "#FFFFFF", "line-width": 9, "line-opacity": 0.9 }}
             layout={{ "line-cap": "round", "line-join": "round" }}
           />
-          {/* Fill: blue stroke rendered on top */}
+          {/* Fill: blue stroke — topmost route layer */}
           <Layer
             id="main-route-layer"
             type="line"
@@ -1319,6 +1346,52 @@ export default function MapScreenOSM({ route, navigation }: Props) {
             </View>
           </Marker>
         )}
+
+        {/* ── Campus area label: "JAMMU UNIVERSITY" ──────────────────────────
+             Rendered as a MapLibre symbol layer so it works on both the
+             custom campus map and the satellite basemap.
+             • zoom-based text-size: subtle at 14, comfortable at 16-17
+             • dark halo ensures legibility over satellite imagery
+             • text-allow-overlap keeps it from being culled by basemap labels */}
+        <GeoJSONSource id="campus-label-source" data={CAMPUS_LABEL_GEOJSON}>
+          <Layer
+            id="campus-label-layer"
+            type="symbol"
+            layout={{
+              "text-field": ["get", "label"],
+              "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
+              "text-size": [
+                "interpolate",
+                ["linear"],
+                ["zoom"],
+                14, 10,
+                16, 14,
+                17, 16,
+                18, 18,
+              ],
+              "text-letter-spacing": 0.12,
+              "text-transform": "uppercase",
+              "text-anchor": "center",
+              "text-allow-overlap": true,
+              "text-ignore-placement": true,
+            }}
+            paint={{
+              "text-color": "#3c89ee",
+              "text-opacity": [
+                "interpolate",
+                ["linear"],
+                ["zoom"],
+                13.5, 0,
+                14.5, 1,
+                18.5, 1,
+                19.5, 0,
+              ],
+              "text-halo-color": "rgba(0, 0, 0, 0.65)",
+              "text-halo-width": 1.5,
+              "text-halo-blur": 0.5,
+            }}
+          />
+        </GeoJSONSource>
       </Map>
 
       {/* ── All UI overlays in a single absolute container so they render
