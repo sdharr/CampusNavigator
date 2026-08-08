@@ -172,6 +172,88 @@ function getBounds(
   return [west, south, east, north];
 }
 
+// ---------------------------------------------------------------------------
+// Place marker visual info — maps a location name to a category icon + colour.
+// All icon names are verified against the installed Ionicons glyph map.
+// ---------------------------------------------------------------------------
+type IconName = React.ComponentProps<typeof Ionicons>["name"];
+interface PlaceMarkerInfo { icon: IconName; color: string; }
+
+function getPlaceMarkerInfo(name: string): PlaceMarkerInfo {
+  const n = name.toLowerCase();
+
+  // Department / educational
+  if (n.includes("department") || n.includes("faculty") || n.includes("college") || n.includes("school"))
+    return { icon: "school", color: "#1565C0" };
+
+  // Museum
+  if (n.includes("museum"))
+    return { icon: "business", color: "#7B1FA2" };
+
+  // Garden / botanical / nature
+  if (n.includes("garden") || n.includes("botanical") || n.includes("cactus") || n.includes("park") || n.includes("nursery"))
+    return { icon: "leaf", color: "#2E7D32" };
+
+  // Canteen / cafe / food
+  if (n.includes("canteen") || n.includes("cafeteria") || n.includes("cafe") || n.includes("restaurant") || n.includes("mess") || n.includes("food"))
+    return { icon: "cafe", color: "#E65100" };
+
+  // Library
+  if (n.includes("library"))
+    return { icon: "book", color: "#00695C" };
+
+  // Health centre / medical
+  if (n.includes("health") || n.includes("medical") || n.includes("hospital") || n.includes("dispensary") || n.includes("clinic"))
+    return { icon: "medkit", color: "#C62828" };
+
+  // Hostel
+  if (n.includes("hostel") || n.includes("residence") || n.includes("dormitory"))
+    return { icon: "bed", color: "#6A1B9A" };
+
+  // Auditorium / hall / seminar
+  if (n.includes("auditorium") || n.includes("seminar") || n.includes("hall") || n.includes("convention"))
+    return { icon: "mic", color: "#4527A0" };
+
+  // Sports / stadium / playground / ground
+  if (n.includes("sports") || n.includes("stadium") || n.includes("playground") || n.includes("ground") || n.includes("gym") || n.includes("fitness"))
+    return { icon: "football", color: "#2E7D32" };
+
+  // 2-wheeler parking
+  if (n.includes("two wheeler") || n.includes("2 wheeler") || n.includes("2-wheeler") || n.includes("bicycle") || n.includes("bike parking") || n.includes("scooter"))
+    return { icon: "bicycle", color: "#37474F" };
+
+  // 4-wheeler parking / car park
+  if (n.includes("four wheeler") || n.includes("4 wheeler") || n.includes("4-wheeler") || n.includes("car park") || n.includes("parking"))
+    return { icon: "car", color: "#455A64" };
+
+  // Gate / entrance
+  if (n.includes("gate") || n.includes("entrance") || n.includes("entry") || n.includes("exit"))
+    return { icon: "enter", color: "#0D47A1" };
+
+  // Administration / office
+  if (n.includes("admin") || n.includes("office") || n.includes("registrar") || n.includes("chancellor") || n.includes("vice chancellor"))
+    return { icon: "business", color: "#1565C0" };
+
+  // Bank / ATM / finance
+  if (n.includes("bank") || n.includes("atm") || n.includes("finance") || n.includes("cash"))
+    return { icon: "cash", color: "#2E7D32" };
+
+  // Store / stationery / shop
+  if (n.includes("store") || n.includes("stationery") || n.includes("shop") || n.includes("mart") || n.includes("xerox"))
+    return { icon: "storefront", color: "#5D4037" };
+
+  // Flag / landmark
+  if (n.includes("flag") || n.includes("monument") || n.includes("statue"))
+    return { icon: "flag", color: "#C62828" };
+
+  // Computer / IT / lab
+  if (n.includes("computer") || n.includes("it ") || n.includes("lab") || n.includes("server") || n.includes("information technology"))
+    return { icon: "desktop", color: "#00695C" };
+
+  // Default / unknown
+  return { icon: "location", color: "#1565C0" };
+}
+
 type Props = NativeStackScreenProps<RootStackParamList, "Map">;
 
 export default function MapScreenOSM({ route, navigation }: Props) {
@@ -1285,18 +1367,14 @@ export default function MapScreenOSM({ route, navigation }: Props) {
         {/* Start location marker (green) — hidden during NAVIGATING */}
         {startLocation && !isNavigating && (
           <Marker lngLat={[startLocation.longitude, startLocation.latitude]} anchor="bottom">
-            <View style={styles.pinMarkerContainer}>
-              <View style={[styles.pinMarkerDot, { backgroundColor: "#4CAF50" }]} />
-            </View>
+            <Ionicons name="location-sharp" size={36} color="#43A047" />
           </Marker>
         )}
 
         {/* End location marker (red) */}
         {endLocation && (
           <Marker lngLat={[endLocation.longitude, endLocation.latitude]} anchor="bottom">
-            <View style={styles.pinMarkerContainer}>
-              <View style={[styles.pinMarkerDot, { backgroundColor: "#F44336" }]} />
-            </View>
+            <Ionicons name="location-sharp" size={36} color="#E53935" />
           </Marker>
         )}
 
@@ -1339,13 +1417,16 @@ export default function MapScreenOSM({ route, navigation }: Props) {
         ))}
 
         {/* Pin location marker */}
-        {pinLocation && typeof pinLocation.latitude === "number" && typeof pinLocation.longitude === "number" && (
-          <Marker lngLat={[pinLocation.longitude, pinLocation.latitude]} anchor="bottom">
-            <View style={styles.pinMarkerContainer}>
-              <View style={[styles.pinMarkerDot, { backgroundColor: "#1565C0" }]} />
-            </View>
-          </Marker>
-        )}
+        {pinLocation && typeof pinLocation.latitude === "number" && typeof pinLocation.longitude === "number" && (() => {
+          const { icon, color } = getPlaceMarkerInfo(pinLocation.name);
+          return (
+            <Marker lngLat={[pinLocation.longitude, pinLocation.latitude]} anchor="bottom">
+              <View style={[styles.poiMarkerBubble, { backgroundColor: color }]}>
+                <Ionicons name={icon} size={17} color="#fff" />
+              </View>
+            </Marker>
+          );
+        })()}
 
         {/* ── Campus area label: "JAMMU UNIVERSITY" ──────────────────────────
              Rendered as a MapLibre symbol layer so it works on both the
@@ -1946,6 +2027,21 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.3,
     shadowRadius: 3,
     elevation: 4,
+  },
+  // -- POI icon bubble (place markers on the map) --------------------------------
+  poiMarkerBubble: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 2,
+    borderColor: "#fff",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.28,
+    shadowRadius: 4,
+    elevation: 6,
   },
   devNodeDot: {
     width: 14,
