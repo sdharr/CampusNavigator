@@ -59,7 +59,7 @@ const DEFAULT_MAP_STYLE = STREET_STYLE;
 // Toggle developer/editing tools for the whole screen.
 // When false, all dev-only UI is hidden but the underlying
 // functions (connectNodes, connectLocation, etc.) are untouched.
-const DEV_MODE = false;
+const DEV_MODE = true;
 
 // ---------------------------------------------------------------------------
 // Live GPS routing configuration
