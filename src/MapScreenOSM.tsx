@@ -59,7 +59,7 @@ const DEFAULT_MAP_STYLE = STREET_STYLE;
 // Toggle developer/editing tools for the whole screen.
 // When false, all dev-only UI is hidden but the underlying
 // functions (connectNodes, connectLocation, etc.) are untouched.
-const DEV_MODE = true;
+const DEV_MODE = false;
 
 // ---------------------------------------------------------------------------
 // Live GPS routing configuration
@@ -1130,13 +1130,33 @@ export default function MapScreenOSM({ route, navigation }: Props) {
       );
       if (d < closestDist) { closestDist = d; closestIdx = i; }
     }
+    // The blue navigation line should always begin at the user's
+    // CURRENT GPS position, not at an old road node.
     const remainingCoords = campusCoords.slice(closestIdx);
+
+    // Build the visible route from the moving GPS position.
+    const updatedRoute = [
+      newGps,
+      ...remainingCoords,
+    ];
 
     connectionNodeIdRef.current = connection.id;
     connectionNodeCoordRef.current = newConnNodeCoord;
-    setGpsAccessSegment([newGps, newConnNodeCoord]);
-    setRouteCoordinates(remainingCoords);
-    computeRouteStats([newGps, ...remainingCoords]);
+
+    // GPS is already the first point of the blue route,
+    // so we no longer need a separate visible access segment.
+    setGpsAccessSegment(null);
+
+    setRouteCoordinates(updatedRoute);
+
+    computeRouteStats(updatedRoute);
+    // const remainingCoords = campusCoords.slice(closestIdx);
+
+    // connectionNodeIdRef.current = connection.id;
+    // connectionNodeCoordRef.current = newConnNodeCoord;
+    // setGpsAccessSegment([newGps, newConnNodeCoord]);
+    // setRouteCoordinates(remainingCoords);
+    // computeRouteStats([newGps, ...remainingCoords]);
   }
 
   function selectNode(node: RoadNode) {
