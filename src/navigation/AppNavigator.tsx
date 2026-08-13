@@ -2,7 +2,7 @@ import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 
 import HomeScreen from "../HomeScreen";
-import MapScreen from "../MapScreen";
+
 import PlaceInfoScreen from "../PlaceInfoScreen";
 import PlaceDetailScreen from "../PlaceDetailScreen";
 import LocationPickerScreen from "../LocationPickerScreen";

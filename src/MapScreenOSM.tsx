@@ -64,9 +64,15 @@ const DEV_MODE = false;
 // ---------------------------------------------------------------------------
 // Live GPS routing configuration
 // ---------------------------------------------------------------------------
-const GPS_RECALC_THRESHOLD_METERS = 15;
+const GPS_RECALC_THRESHOLD_METERS = 15;   // off-route: min movement to re-run Dijkstra
+const GPS_PROGRESS_THRESHOLD_METERS = 1;  // on-route: min movement to trim blue route
 const GPS_MAX_INSIDE_RADIUS_METERS = 300;
 const ARRIVAL_THRESHOLD_METERS = 20;
+const GPS_MAX_ACCURACY_METERS = 50;       // ignore fixes with accuracy worse than this
+/** Haversine distance from the user's GPS to the nearest point on the blue-route
+ *  polyline at or below which the user is considered to have joined the route.
+ *  The orange access segment is permanently hidden once this threshold is crossed. */
+const ON_ROUTE_THRESHOLD_METERS = 15;
 
 // Campus centre (lon, lat for MapLibre)
 const CAMPUS_CENTER_LNG = 74.867680;
@@ -153,6 +159,63 @@ function routeOptionsToGeoJSON(
         properties: { routeIndex: i },
       })),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Geometry helpers for nearest-point-on-route calculations
+// ---------------------------------------------------------------------------
+
+/**
+ * Project point P onto the line segment A→B.
+ * Returns the nearest point on the segment and the parametric t (0 = A, 1 = B).
+ * Uses a cosine-latitude correction so the projection is geographically correct.
+ */
+function nearestPointOnSegment(
+  pLat: number, pLon: number,
+  aLat: number, aLon: number,
+  bLat: number, bLon: number
+): { lat: number; lon: number; t: number } {
+  const cosLat = Math.cos(((aLat + bLat) / 2) * Math.PI / 180);
+  const dx = (bLon - aLon) * cosLat;
+  const dy = bLat - aLat;
+  const len2 = dx * dx + dy * dy;
+  let t = 0;
+  if (len2 > 1e-12) {
+    t = ((pLon - aLon) * cosLat * dx + (pLat - aLat) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+  }
+  return {
+    lat: aLat + t * (bLat - aLat),
+    lon: aLon + t * (bLon - aLon),
+    t,
+  };
+}
+
+/**
+ * Find the nearest point on a polyline to a given GPS coordinate.
+ * Checks every segment — the closest point may lie in the interior of a segment,
+ * not only at a vertex.  Returns the projected nearest point, the zero-based
+ * segment index, the parametric t, and the Haversine distance from GPS to that point.
+ */
+function nearestPointOnPolyline(
+  gpsLat: number,
+  gpsLon: number,
+  coords: { latitude: number; longitude: number }[]
+): { lat: number; lon: number; segmentIndex: number; t: number; dist: number } | null {
+  if (coords.length < 2) return null;
+  let best: { lat: number; lon: number; segmentIndex: number; t: number; dist: number } | null = null;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const p = nearestPointOnSegment(
+      gpsLat, gpsLon,
+      coords[i].latitude, coords[i].longitude,
+      coords[i + 1].latitude, coords[i + 1].longitude
+    );
+    const dist = haversineDistance(gpsLat, gpsLon, p.lat, p.lon);
+    if (best === null || dist < best.dist) {
+      best = { lat: p.lat, lon: p.lon, segmentIndex: i, t: p.t, dist };
+    }
+  }
+  return best;
 }
 
 /** Compute [west, south, east, north] bounds from coords array */
@@ -329,6 +392,35 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   const isOutsideCampusRef = useRef<boolean>(false);
   const lastGpsRef = useRef<{ latitude: number; longitude: number } | null>(null);
   const roadNodesRef = useRef<RoadNode[]>([]);
+  /**
+   * Mirror of routeCoordinates state for use inside the GPS-watcher callback.
+   * The watcher closure is created once (in startLiveGpsWatcher) and cannot
+   * safely read React state — it would always see the stale initial value.
+   * Keeping a ref in sync lets onGpsUpdate always read the current route.
+   */
+  const routeCoordsRef = useRef<{ latitude: number; longitude: number }[]>([]);
+  /**
+   * True once the user's GPS dot has come within ON_ROUTE_THRESHOLD_METERS of
+   * the blue-route polyline.  Once joined, route progress is tracked purely
+   * geometrically (nearest-point-on-polyline trim) and Dijkstra is not called
+   * on every GPS update.  Reset to false each time navigation is (re)started.
+   */
+  const hasJoinedRouteRef = useRef<boolean>(false);
+  /**
+   * Monotonic progress tracking — records the shortest remaining road-route
+   * distance seen so far. GPS noise can advance this downward but never back up.
+   * A new GPS fix is only accepted if the resulting remaining route distance is
+   * less than or equal to this value. Reset to Infinity each time a new route
+   * geometry is installed.
+   */
+  const lastProgressRemainingDistRef = useRef<number>(Infinity);
+  /**
+   * Ref mirror of isFollowingUser state, so the GPS-watcher closure (created
+   * once) always reads the current value without a stale closure.
+   */
+  const isFollowingUserRef = useRef<boolean>(false);
+  // Keep the ref in sync so the GPS-watcher closure always reads the current value.
+  useEffect(() => { isFollowingUserRef.current = isFollowingUser; }, [isFollowingUser]);
   // Tracks the last route.params object we have already processed so that
   // React Navigation re-creating the params reference (due to MapScreenOSM's
   // own state updates) does not re-fire the camera flyTo and override the
@@ -337,6 +429,10 @@ export default function MapScreenOSM({ route, navigation }: Props) {
   // If the user presses Find Route before the graph has finished loading,
   // we store the intent here and flush it the moment isGraphReady flips.
   const pendingRouteRef = useRef<boolean>(false);
+  // Tracks the last (from, to) pair for which the auto-route was triggered so
+  // that selecting the same two locations again does not fire a duplicate route
+  // calculation.
+  const lastAutoRoutedRef = useRef<string>("");
   // True once the native Map view has fired onDidFinishLoadingMap and the
   // Camera native node is guaranteed to exist.  flyTo/easeTo are silently
   // dropped before this point (findNodeHandle returns null).
@@ -476,8 +572,31 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     }
   }, [route.params]);
 
-  // loadData() removed: all data now comes from CampusDataContext.
-  // See the isCampusReady useEffect above for ref-sync + focusCampus logic.
+  // ---------------------------------------------------------------------------
+  // Auto-route: trigger findRoute whenever BOTH from and to are valid.
+  // ---------------------------------------------------------------------------
+  // This useEffect runs in a new render cycle AFTER the state updates for from
+  // and to have been committed, so `from` and `to` here are always the current
+  // (latest) values — never stale.
+  //
+  // Duplicate-prevention: lastAutoRoutedRef records the last "from|to" key that
+  // was sent to findRoute.  Selecting the same pair again (e.g. after a swap
+  // that ends up back at the original pairing) will not re-run the calculation.
+  // The key is cleared in clearRoute / resetAll so a new pair always routes.
+  useEffect(() => {
+    if (!from || !to) {
+      // One or both locations cleared — nothing to route.
+      return;
+    }
+    const key = `${from}|${to}`;
+    if (key === lastAutoRoutedRef.current) {
+      // Same pair as last time — skip duplicate.
+      return;
+    }
+    lastAutoRoutedRef.current = key;
+    findRoute();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [from, to]);
 
   function focusCampus() {
     // Fly to the fixed campus centre at zoom 16 — matches the initialViewState
@@ -529,6 +648,11 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     connectionNodeCoordRef.current = null;
     destinationRef.current = null;
     lastGpsRef.current = null;
+    routeCoordsRef.current = [];
+    hasJoinedRouteRef.current = false;
+    lastProgressRemainingDistRef.current = Infinity;
+    // Clear the duplicate-prevention key so the next from+to pair always routes.
+    lastAutoRoutedRef.current = "";
   }
 
   /**
@@ -616,6 +740,10 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     console.log(`[DEBUG-5] setting selectedRouteIndex=${index}, coords.length=${selectedRoute.length}`);
     setSelectedRouteIndex(index);
     setRouteCoordinates(selectedRoute);
+    // Keep the ref that onGpsUpdate reads in sync with the newly selected route.
+    routeCoordsRef.current = selectedRoute;
+    // New route geometry — reset monotonic progress.
+    lastProgressRemainingDistRef.current = Infinity;
     if (gpsAccessSegment && gpsAccessSegment.length >= 2) {
       const fullCoords = [gpsAccessSegment[0], ...selectedRoute];
       computeRouteStats(fullCoords);
@@ -991,6 +1119,12 @@ export default function MapScreenOSM({ route, navigation }: Props) {
       setRouteOptions([campusCoords, ...altCampusOptions]);
       setSelectedRouteIndex(0);
       setRouteCoordinates(campusCoords);
+      // Sync the ref that onGpsUpdate reads so it always sees the current route
+      // geometry without stale-closure issues.
+      routeCoordsRef.current = campusCoords;
+      // Reset join-state and monotonic progress for fresh navigation.
+      hasJoinedRouteRef.current = false;
+      lastProgressRemainingDistRef.current = Infinity;
       setGpsAccessSegment([gpsCoord, connNodeCoord]);
       setLiveGpsPosition(gpsCoord);
       setNavPhase(NavigationPhase.NAVIGATING);
@@ -1027,6 +1161,9 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     connectionNodeIdRef.current = null;
     connectionNodeCoordRef.current = null;
     lastGpsRef.current = null;
+    routeCoordsRef.current = [];
+    hasJoinedRouteRef.current = false;
+    lastProgressRemainingDistRef.current = Infinity;
     if (routeCoordinates.length > 0) {
       setNavPhase(NavigationPhase.ROUTE_PREVIEW);
     } else {
@@ -1041,7 +1178,16 @@ export default function MapScreenOSM({ route, navigation }: Props) {
     stopLiveGpsWatcher();
     try {
       const sub = await ExpoLocation.watchPositionAsync(
-        { accuracy: ExpoLocation.Accuracy.High, distanceInterval: 5 },
+        {
+          // BestForNavigation requests the highest-accuracy mode the OS supports.
+          // distanceInterval: 1 ensures Android does not suppress callbacks until
+          // 5 m have elapsed — the OS may still batch updates but we process every
+          // delivered fix regardless of how far the device has physically moved.
+          // timeInterval is honoured by Android as a minimum delivery cadence.
+          accuracy: ExpoLocation.Accuracy.BestForNavigation,
+          distanceInterval: 1,
+          timeInterval: 1000,
+        },
         onGpsUpdate
       );
       locationWatcherRef.current = sub;
@@ -1056,30 +1202,43 @@ export default function MapScreenOSM({ route, navigation }: Props) {
       latitude: pos.coords.latitude,
       longitude: pos.coords.longitude,
     };
+
+    // ── Accuracy guard ───────────────────────────────────────────────────────
+    // Wildly inaccurate fixes would project the GPS onto wrong route segments.
+    // Skip but do NOT update lastGpsRef so a subsequent accurate fix runs normally.
+    const accuracy = pos.coords.accuracy ?? 0;
+    if (accuracy > GPS_MAX_ACCURACY_METERS) {
+      console.log(`[GPS NAV] GPS UPDATE (skipped — accuracy ${Math.round(accuracy)} m > ${GPS_MAX_ACCURACY_METERS} m)`);
+      return;
+    }
+
     const connNodeId = connectionNodeIdRef.current;
-    const connNodeCoord = connectionNodeCoordRef.current;
-    const destId = destinationRef.current;
+    const destId     = destinationRef.current;
+    if (!connNodeId || !destId) return;
 
-    if (!connNodeId || !connNodeCoord || !destId) return;
-
+    // ── 1. Always update the GPS dot ─────────────────────────────────────────
     setLiveGpsPosition(newGps);
-    setGpsAccessSegment([newGps, connNodeCoord]);
 
-    // Arrival check
+    // ── 2. Arrival check — BEFORE any route trimming ─────────────────────────
     const destCoord = coordinateMapRef.current[destId];
     if (destCoord) {
-      const distToDest = haversineDistance(newGps.latitude, newGps.longitude, destCoord.latitude, destCoord.longitude);
+      const distToDest = haversineDistance(
+        newGps.latitude, newGps.longitude,
+        destCoord.latitude, destCoord.longitude
+      );
       if (distToDest < ARRIVAL_THRESHOLD_METERS) {
+        console.log('[GPS NAV] ARRIVED');
         stopLiveGpsWatcher();
         setGpsAccessSegment(null);
         setRouteCoordinates([]);
+        routeCoordsRef.current = [];
         setNavPhase(NavigationPhase.ARRIVED);
         return;
       }
     }
 
-    // Camera follow
-    if (isFollowingUser) {
+    // ── 3. Camera follow ─────────────────────────────────────────────────────
+    if (isFollowingUserRef.current) {
       cameraRef.current?.easeTo({
         center: [newGps.longitude, newGps.latitude],
         zoom: 17,
@@ -1087,26 +1246,252 @@ export default function MapScreenOSM({ route, navigation }: Props) {
       });
     }
 
-    // Movement threshold
+    // currentRoute is ALWAYS pure road geometry — no raw GPS coords inside.
+    const currentRoute = routeCoordsRef.current;
+
+    // ── Find nearest point on the current road route ─────────────────────────
+    // Run on every update: needed for both join detection and on-route progress.
+    const nearest = currentRoute.length >= 2
+      ? nearestPointOnPolyline(newGps.latitude, newGps.longitude, currentRoute)
+      : null;
+
+    const distToRoute = nearest ? nearest.dist : Infinity;
+
+    // ── 4. ON-ROUTE path ─────────────────────────────────────────────────────
+    if (hasJoinedRouteRef.current) {
+
+      // Off-route escape: GPS has drifted far from the road route.
+      // Re-enter off-route handling so Dijkstra can recalculate.
+      if (distToRoute > ON_ROUTE_THRESHOLD_METERS) {
+        hasJoinedRouteRef.current = false;
+        lastProgressRemainingDistRef.current = Infinity;
+        console.log('[GPS NAV] OFF ROUTE', {
+          gps: newGps,
+          accuracy: Math.round(accuracy),
+          distToRoute: Math.round(distToRoute),
+          mode: 'OFF_ROUTE',
+        });
+        // Fall through to off-route handling below.
+      } else if (nearest && currentRoute.length >= 2) {
+        // ── Still on route: trim road geometry forward ──────────────────────
+        const movedMeters = lastGpsRef.current
+          ? haversineDistance(
+              lastGpsRef.current.latitude, lastGpsRef.current.longitude,
+              newGps.latitude, newGps.longitude
+            )
+          : GPS_PROGRESS_THRESHOLD_METERS; // first update always runs
+
+        if (movedMeters < GPS_PROGRESS_THRESHOLD_METERS) {
+          // Not enough movement — still log GPS UPDATE and return.
+          console.log('[GPS NAV] GPS UPDATE', {
+            latitude: newGps.latitude,
+            longitude: newGps.longitude,
+            accuracy: Math.round(accuracy),
+            distToRoute: Math.round(distToRoute),
+            mode: 'ON_ROUTE',
+          });
+          return;
+        }
+
+        const { lat: nLat, lon: nLon, segmentIndex, t } = nearest;
+
+        // Build the remaining ROAD route from the projected point onward.
+        // IMPORTANT: GPS is NOT inserted into this array. routeCoordinates
+        // must always contain only road-graph geometry.
+        let roadRemaining: { latitude: number; longitude: number }[];
+        if (t >= 0.99) {
+          // Projection is at/past the end of this segment — snap to next vertex.
+          roadRemaining = currentRoute.slice(segmentIndex + 1);
+        } else {
+          roadRemaining = [
+            { latitude: nLat, longitude: nLon },
+            ...currentRoute.slice(segmentIndex + 1),
+          ];
+        }
+
+        if (roadRemaining.length === 0) {
+          // Past the final segment — arrival check next tick handles this.
+          return;
+        }
+
+        // Monotonic check: remaining distance must only decrease.
+        const newRemainingDist = roadRemaining.reduce((acc, c, i, arr) =>
+          i === 0 ? 0 : acc + haversineDistance(
+            arr[i - 1].latitude, arr[i - 1].longitude,
+            c.latitude, c.longitude
+          ), 0
+        );
+
+        if (newRemainingDist > lastProgressRemainingDistRef.current) {
+          // GPS noise would move progress backward — reject this fix.
+          console.log('[GPS NAV] GPS UPDATE (monotonic reject)', {
+            latitude: newGps.latitude,
+            longitude: newGps.longitude,
+            accuracy: Math.round(accuracy),
+            distToRoute: Math.round(distToRoute),
+            mode: 'ON_ROUTE',
+          });
+          return;
+        }
+
+        const projectedPoint = { latitude: nLat, longitude: nLon };
+        const gpsToProjDist  = haversineDistance(
+          newGps.latitude, newGps.longitude, nLat, nLon
+        );
+
+        // GPS-to-route connector: show when GPS is detectably off the road centre.
+        // Hide when GPS is essentially on the road (< 1 m) to avoid visual clutter.
+        if (gpsToProjDist < 1.0) {
+          setGpsAccessSegment(null);
+        } else {
+          setGpsAccessSegment([newGps, projectedPoint]);
+        }
+
+        // Update road route (pure road geometry — no GPS coordinates).
+        lastProgressRemainingDistRef.current = newRemainingDist;
+        lastGpsRef.current = newGps;
+        routeCoordsRef.current = roadRemaining;
+        setRouteCoordinates(roadRemaining);
+        // Distance display includes GPS → projected-point segment.
+        computeRouteStats([newGps, ...roadRemaining]);
+
+        console.log('[GPS NAV] ROUTE PROGRESS', {
+          latitude: newGps.latitude,
+          longitude: newGps.longitude,
+          accuracy: Math.round(accuracy),
+          movedMeters: Math.round(movedMeters),
+          distToRoute: Math.round(distToRoute),
+          matchedSegment: segmentIndex,
+          matchedT: Math.round(t * 100) / 100,
+          remainingDistance: Math.round(newRemainingDist),
+          mode: 'ON_ROUTE',
+        });
+
+        // Refresh connection node for potential future off-route recalc.
+        const conn = findValidConnectionNode(
+          newGps.latitude, newGps.longitude,
+          roadNodesRef.current, graphRef.current
+        );
+        if (conn) {
+          connectionNodeIdRef.current  = conn.id;
+          connectionNodeCoordRef.current = conn.coord;
+        }
+        return;
+      } else {
+        // Route is too short to project onto — defer to arrival check.
+        return;
+      }
+    }
+
+    // ── 5. NOT YET ON ROUTE — join check ────────────────────────────────────
+
+    if (nearest && distToRoute <= ON_ROUTE_THRESHOLD_METERS) {
+      // User has reached within ON_ROUTE_THRESHOLD_METERS of the road route.
+
+      const { lat: nLat, lon: nLon, segmentIndex, t } = nearest;
+
+      let roadRemaining: { latitude: number; longitude: number }[];
+      if (t >= 0.99) {
+        roadRemaining = currentRoute.slice(segmentIndex + 1);
+      } else {
+        roadRemaining = [
+          { latitude: nLat, longitude: nLon },
+          ...currentRoute.slice(segmentIndex + 1),
+        ];
+      }
+
+      if (roadRemaining.length === 0) {
+        console.log('[GPS NAV] JOIN at final segment — deferring to arrival check');
+        return;
+      }
+
+      const projectedPoint = { latitude: nLat, longitude: nLon };
+      const gpsToProjDist  = haversineDistance(
+        newGps.latitude, newGps.longitude, nLat, nLon
+      );
+
+      const newRemainingDist = roadRemaining.reduce((acc, c, i, arr) =>
+        i === 0 ? 0 : acc + haversineDistance(
+          arr[i - 1].latitude, arr[i - 1].longitude,
+          c.latitude, c.longitude
+        ), 0
+      );
+
+      hasJoinedRouteRef.current = true;
+      lastProgressRemainingDistRef.current = newRemainingDist;
+      lastGpsRef.current = newGps;
+
+      // Orange segment hides when GPS is within 1 m of the road; shown otherwise.
+      if (gpsToProjDist < 1.0) {
+        setGpsAccessSegment(null);
+      } else {
+        setGpsAccessSegment([newGps, projectedPoint]);
+      }
+
+      // Store pure road geometry — GPS coordinates never enter routeCoordinates.
+      routeCoordsRef.current = roadRemaining;
+      setRouteCoordinates(roadRemaining);
+      // Distance display includes GPS → projected-point segment.
+      computeRouteStats([newGps, ...roadRemaining]);
+
+      console.log('[GPS NAV] ROUTE JOIN', {
+        latitude: newGps.latitude,
+        longitude: newGps.longitude,
+        accuracy: Math.round(accuracy),
+        distToRoute: Math.round(distToRoute),
+        matchedSegment: segmentIndex,
+        matchedT: Math.round(t * 100) / 100,
+        remainingDistance: Math.round(newRemainingDist),
+        mode: 'JOINING_ROUTE',
+      });
+
+      const conn = findValidConnectionNode(
+        newGps.latitude, newGps.longitude,
+        roadNodesRef.current, graphRef.current
+      );
+      if (conn) {
+        connectionNodeIdRef.current  = conn.id;
+        connectionNodeCoordRef.current = conn.coord;
+      }
+      return;
+    }
+
+    // ── 6. Off-route — update orange segment on every callback ───────────────
+    const freshConnNodeCoord = connectionNodeCoordRef.current;
+    if (freshConnNodeCoord) {
+      setGpsAccessSegment([newGps, freshConnNodeCoord]);
+    }
+
+    console.log('[GPS NAV] GPS UPDATE', {
+      latitude: newGps.latitude,
+      longitude: newGps.longitude,
+      accuracy: Math.round(accuracy),
+      distToRoute: nearest ? Math.round(nearest.dist) : null,
+      routeLength: currentRoute.length,
+      mode: 'OFF_ROUTE',
+    });
+
+    // ── 7. Off-route Dijkstra — only after enough movement ───────────────────
+    if (isOutsideCampusRef.current) return;
+
     const last = lastGpsRef.current;
-    const moved = last
+    const movedForRecalc = last
       ? haversineDistance(last.latitude, last.longitude, newGps.latitude, newGps.longitude)
       : Infinity;
-    lastGpsRef.current = newGps;
 
-    if (isOutsideCampusRef.current) return;
-    if (moved < GPS_RECALC_THRESHOLD_METERS) return;
+    if (movedForRecalc < GPS_RECALC_THRESHOLD_METERS) return;
 
-    const connection = findValidConnectionNode(newGps.latitude, newGps.longitude, roadNodesRef.current, graphRef.current);
+    const connection = findValidConnectionNode(
+      newGps.latitude, newGps.longitude,
+      roadNodesRef.current, graphRef.current
+    );
     if (!connection) return;
 
-    // ----- FIX: removed `if (connection.id === connNodeId) return;` -----
-    // That guard blocked ALL route/distance updates whenever the nearest road
-    // node hadn't changed yet — the common case while walking along a segment.
-    // We now always recompute the remaining route after sufficient movement.
-
     const newConnNodeCoord = connection.coord;
-    const accessDist = haversineDistance(newGps.latitude, newGps.longitude, newConnNodeCoord.latitude, newConnNodeCoord.longitude);
+    const accessDist = haversineDistance(
+      newGps.latitude, newGps.longitude,
+      newConnNodeCoord.latitude, newConnNodeCoord.longitude
+    );
     const virtualGraph = buildVirtualGraph(graphRef.current, connection.id, accessDist);
 
     coordinateMapRef.current[GPS_VIRTUAL_NODE_ID] = newGps;
@@ -1115,48 +1500,36 @@ export default function MapScreenOSM({ route, navigation }: Props) {
 
     if (path.length < 2) return;
 
-    const campusPath = path.slice(1);
-    const campusCoords = campusPath.map((id) => coordinateMapRef.current[id]).filter(Boolean) as { latitude: number; longitude: number }[];
+    // path[0] = GPS_VIRTUAL_NODE_ID (skip), rest = road nodes
+    const campusPath   = path.slice(1);
+    const campusCoords = campusPath
+      .map((id) => coordinateMapRef.current[id])
+      .filter(Boolean) as { latitude: number; longitude: number }[];
 
-    // Trim the leading waypoints that the user has already walked past.
-    // Find the waypoint index closest to the current GPS position and slice
-    // from there so the already-walked portion of the blue line disappears.
-    let closestIdx = 0;
-    let closestDist = Infinity;
-    for (let i = 0; i < campusCoords.length; i++) {
-      const d = haversineDistance(
-        newGps.latitude, newGps.longitude,
-        campusCoords[i].latitude, campusCoords[i].longitude
-      );
-      if (d < closestDist) { closestDist = d; closestIdx = i; }
-    }
-    // The blue navigation line should always begin at the user's
-    // CURRENT GPS position, not at an old road node.
-    const remainingCoords = campusCoords.slice(closestIdx);
-
-    // Build the visible route from the moving GPS position.
-    const updatedRoute = [
-      newGps,
-      ...remainingCoords,
-    ];
-
-    connectionNodeIdRef.current = connection.id;
+    connectionNodeIdRef.current   = connection.id;
     connectionNodeCoordRef.current = newConnNodeCoord;
+    lastGpsRef.current = newGps;
 
-    // GPS is already the first point of the blue route,
-    // so we no longer need a separate visible access segment.
-    setGpsAccessSegment(null);
+    // New road route geometry — reset monotonic progress.
+    lastProgressRemainingDistRef.current = Infinity;
 
-    setRouteCoordinates(updatedRoute);
+    // Orange segment bridges GPS → first road connection node.
+    setGpsAccessSegment([newGps, newConnNodeCoord]);
+    // routeCoordinates = pure road geometry (no GPS).
+    routeCoordsRef.current = campusCoords;
+    setRouteCoordinates(campusCoords);
+    // Distance display includes the GPS → connection-node access segment.
+    computeRouteStats([newGps, ...campusCoords]);
 
-    computeRouteStats(updatedRoute);
-    // const remainingCoords = campusCoords.slice(closestIdx);
-
-    // connectionNodeIdRef.current = connection.id;
-    // connectionNodeCoordRef.current = newConnNodeCoord;
-    // setGpsAccessSegment([newGps, newConnNodeCoord]);
-    // setRouteCoordinates(remainingCoords);
-    // computeRouteStats([newGps, ...remainingCoords]);
+    console.log('[GPS NAV] DIJKSTRA RECALC', {
+      latitude: newGps.latitude,
+      longitude: newGps.longitude,
+      accuracy: Math.round(accuracy),
+      movedMeters: Math.round(movedForRecalc),
+      connectionNodeId: connection.id,
+      routeLength: campusCoords.length,
+      mode: 'OFF_ROUTE',
+    });
   }
 
   function selectNode(node: RoadNode) {
@@ -1638,26 +2011,13 @@ export default function MapScreenOSM({ route, navigation }: Props) {
                 </View>
               </View>
 
-              {/* ── Row 2: Find Route ── */}
-              <TouchableOpacity
-                style={[
-                  styles.findRouteButton,
-                  isFindingRoute && styles.findRouteButtonDisabled,
-                ]}
-                onPress={findRoute}
-                activeOpacity={0.85}
-                disabled={isFindingRoute}
-              >
-                <Ionicons
-                  name="navigate"
-                  size={16}
-                  color="#1565C0"
-                  style={{ marginRight: 6 }}
-                />
-                <Text style={styles.findRouteButtonText}>
-                  {isFindingRoute ? "Finding Route…" : "Find Route"}
-                </Text>
-              </TouchableOpacity>
+              {/* ── Row 2: loading indicator (shown while route is being calculated) ── */}
+              {isFindingRoute && (
+                <View style={styles.autoRouteLoadingRow}>
+                  <Ionicons name="navigate" size={14} color="#1565C0" style={{ marginRight: 6 }} />
+                  <Text style={styles.autoRouteLoadingText}>Finding Route…</Text>
+                </View>
+              )}
             </View>
           </SafeAreaView>
         )}
@@ -1874,6 +2234,14 @@ const styles = StyleSheet.create({
   },
   findRouteButtonText: { color: BLUE_PRIMARY, fontWeight: "700", fontSize: 14, letterSpacing: 0.3 },
   findRouteButtonDisabled: { opacity: 0.55 },
+  // Inline loading indicator shown while the auto-route is being calculated.
+  autoRouteLoadingRow: {
+    flexDirection: "row", alignItems: "center", justifyContent: "center",
+    paddingVertical: 8,
+  },
+  autoRouteLoadingText: {
+    color: BLUE_PRIMARY, fontWeight: "600", fontSize: 13, letterSpacing: 0.2,
+  },
 
   // -- Floating map-style toggle ------------------------------------------------
   mapStyleToggle: {
