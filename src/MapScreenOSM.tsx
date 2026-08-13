@@ -1757,8 +1757,8 @@ export default function MapScreenOSM({ route, navigation }: Props) {
           </GeoJSONSource>
         )}
 
-        {/* Start location marker (green) — hidden during NAVIGATING */}
-        {startLocation && !isNavigating && (
+        {/* Start location marker (green) — hidden during NAVIGATING and ARRIVED */}
+        {startLocation && !isNavigating && !isArrived && (
           <Marker lngLat={[startLocation.longitude, startLocation.latitude]} anchor="bottom">
             <Ionicons name="location-sharp" size={36} color="#43A047" />
           </Marker>
